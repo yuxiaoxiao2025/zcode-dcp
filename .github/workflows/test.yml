@@ -19,4 +19,5 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - name: Run test suite (zero dependencies, no install step)
+        shell: bash
         run: node --test test/*.test.mjs
