@@ -287,10 +287,12 @@ Listed honestly, with the reason for each:
 ## Development
 
 Zero dependencies — run the test suite with `node --test test/*.test.mjs`
-(Node 20+). Note: the integration tests in `test/mcp.test.mjs` use Windows
-process helpers (`cmd.exe` / `taskkill`) for daemon cleanup, so the full
-suite currently requires Windows (CI runs on `windows-latest`). The plugin
-runtime code itself is pure cross-platform Node.
+(Node 22+; the suite relies on V8 JSON error messages with position info
+and is verified on Node 22/24). Note: the integration tests in
+`test/mcp.test.mjs` use Windows process helpers (`cmd.exe` / `taskkill`)
+for daemon cleanup, so the full suite currently requires Windows (CI runs
+on `windows-latest`). The plugin runtime code itself is pure
+cross-platform Node.
 
 ---
 
