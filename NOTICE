@@ -1,0 +1,11 @@
+# NOTICE
+
+本插件（zcode-dcp）衍生自 **@tarquinen/opencode-dcp v3.1.15**
+（https://github.com/Opencode-DCP/opencode-dynamic-context-pruning ，AGPL-3.0-or-later，© DCP authors）。
+
+- 衍生代码保持 AGPL-3.0-or-later（见 LICENSE），各移植模块文件头注明来源文件。
+- 移植架构与逐项能力差异（已移植/降级/不可行 + 原因）见仓库内 `docs/CAPABILITY-MAPPING.md`。
+- 行为基准：裁剪策略以 opencode-dcp v3.1.15 源码为准（用户项目纪律）。
+
+This product includes software developed as part of opencode-dynamic-context-pruning
+(Dynamic Context Pruning plugin for OpenCode), licensed under AGPL-3.0-or-later.

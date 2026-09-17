@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "dcp": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/mcp-server.mjs"],
+      "env": {
+        "DCP_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}",
+        "DCP_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}"
+      },
+      "enabled": true,
+      "timeoutMs": 60000
+    }
+  }
+}

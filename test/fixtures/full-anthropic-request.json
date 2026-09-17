@@ -1,0 +1,36 @@
+{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "stream": true,
+  "system": [
+    { "type": "text", "text": "You are ZCode, an AI coding assistant." },
+    { "type": "text", "text": "Be concise. Use tools when helpful." }
+  ],
+  "tools": [
+    {
+      "name": "Read",
+      "description": "Read a file",
+      "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } } }
+    },
+    {
+      "name": "mcp__dcp__compress",
+      "description": "Compress tool",
+      "input_schema": { "type": "object" }
+    }
+  ],
+  "tool_choice": { "type": "auto" },
+  "thinking": { "type": "enabled", "budget_tokens": 1024 },
+  "output_config": { "format": "text" },
+  "metadata": {
+    "user_id": "user_test_001",
+    "session_id": "14255323-976c-4ee6-a987-39a4b8796fc8",
+    "large_id": 9007199254740993,
+    "nested": { "value_with_slash": "a\\/b", "chinese": "\u4e2d\u6587" }
+  },
+  "messages": [
+    { "role": "user", "content": "Read the file foo.ts" },
+    { "role": "assistant", "content": [ { "type": "text", "text": "Calling Read." }, { "type": "tool_use", "id": "toolu_1", "name": "Read", "input": { "file_path": "src/foo.ts" } } ] },
+    { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "toolu_1", "content": "file contents" } ] },
+    { "role": "assistant", "content": [ { "type": "text", "text": "done" } ] }
+  ]
+}

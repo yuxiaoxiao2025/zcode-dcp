@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs",
+            "env": {
+              "DCP_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}",
+              "DCP_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

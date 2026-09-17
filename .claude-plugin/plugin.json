@@ -1,0 +1,28 @@
+{
+  "name": "zcode-dcp",
+  "version": "0.1.4",
+  "description": "Dynamic Context Pruning for ZCode — prunes obsolete tool outputs from model context via local proxy (port of opencode-dcp)",
+  "description_i18n": {
+    "en": "Dynamic Context Pruning for ZCode — local proxy that prunes obsolete tool outputs (port of opencode-dcp)",
+    "zh-CN": "ZCode 动态上下文裁剪——本地代理裁剪过时工具输出，省 token（移植自 opencode-dcp）"
+  },
+  "author": {
+    "name": "port-opencode-dcp-to-zcode project"
+  },
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://github.com/yuxiaoxiao2025/zcode-dcp",
+  "keywords": [
+    "context",
+    "pruning",
+    "tokens",
+    "proxy"
+  ],
+  "userConfig": {
+    "proxyPort": {
+      "title": "代理端口",
+      "type": "number",
+      "default": 8367,
+      "description": "首次安装引导值；实际以 ~/.zcode/dcp/dcp.jsonc 的 proxy.port 为准"
+    }
+  }
+}

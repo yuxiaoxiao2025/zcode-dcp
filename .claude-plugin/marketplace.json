@@ -1,0 +1,22 @@
+{
+  "name": "zcode-dcp",
+  "description": "Dynamic Context Pruning for ZCode — local proxy that prunes obsolete tool outputs to save tokens (port of opencode-dcp, AGPL-3.0)",
+  "owner": {
+    "name": "yuxiaoxiao2025"
+  },
+  "plugins": [
+    {
+      "name": "zcode-dcp",
+      "source": "./",
+      "description": "Dynamic Context Pruning for ZCode — local proxy prunes obsolete tool outputs to save tokens (port of opencode-dcp v3.1.15, AGPL-3.0)",
+      "version": "0.1.4",
+      "category": "developer-tools",
+      "tags": [
+        "context",
+        "tokens",
+        "pruning",
+        "proxy"
+      ]
+    }
+  ]
+}
