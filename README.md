@@ -284,6 +284,16 @@ Listed honestly, with the reason for each:
 
 ---
 
+## Development
+
+Zero dependencies — run the test suite with `node --test test/*.test.mjs`
+(Node 20+). Note: the integration tests in `test/mcp.test.mjs` use Windows
+process helpers (`cmd.exe` / `taskkill`) for daemon cleanup, so the full
+suite currently requires Windows (CI runs on `windows-latest`). The plugin
+runtime code itself is pure cross-platform Node.
+
+---
+
 ## License
 
 `AGPL-3.0-or-later`. Derived from `@tarquinen/opencode-dcp` v3.1.15.

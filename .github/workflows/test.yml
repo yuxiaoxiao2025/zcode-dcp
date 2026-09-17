@@ -6,7 +6,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # The integration tests in test/mcp.test.mjs use Windows process helpers
+    # (cmd.exe / taskkill) for daemon cleanup, so the suite requires Windows.
+    # The plugin runtime code itself is pure cross-platform Node.
+    runs-on: windows-latest
     strategy:
       matrix:
         node: [20, 22]

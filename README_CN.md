@@ -259,6 +259,15 @@ HTTP 守护进程。代理在转发请求**前**，只对请求体的 `messages`
 
 ---
 
+## 开发与测试
+
+零依赖——`node --test test/*.test.mjs` 即可跑全套测试（Node 20+）。
+注意：`test/mcp.test.mjs` 的集成测试在守护进程清理处使用了 Windows
+专用助手（`cmd.exe` / `taskkill`），完整测试套件目前要求在 Windows 上
+运行（CI 跑在 `windows-latest`）。插件运行时代码本身是纯跨平台 Node。
+
+---
+
 ## 许可
 
 `AGPL-3.0-or-later`，衍生自 `@tarquinen/opencode-dcp` v3.1.15。逐
