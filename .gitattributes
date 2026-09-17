@@ -1,0 +1,6 @@
+# Normalize all text files to LF in the repo and on checkout.
+# Rationale: test/schema.test.mjs parseFrontmatter drops the last
+# frontmatter key when it carries a trailing CR (Windows autocrlf
+# checkouts). Forcing LF everywhere keeps the suite deterministic
+# across platforms until the parser is hardened.
+* text=auto eol=lf
