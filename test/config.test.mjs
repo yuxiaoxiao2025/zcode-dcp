@@ -114,7 +114,7 @@ describe("DEFAULT_CONFIG", () => {
         assert.equal(c.showCompression, false)
         assert.equal(c.summaryBuffer, true)
         assert.equal(c.maxContextLimit, 100000)
-        assert.equal(c.minContextLimit, 50000)
+        assert.equal(c.minContextLimit, 30000)
         assert.equal(c.nudgeFrequency, 5)
         assert.equal(c.iterationNudgeThreshold, 15)
         assert.equal(c.nudgeForce, "soft")

@@ -267,6 +267,43 @@ test("MCP: initialize echoes protocolVersion + capabilities + tools", async () =
 })
 
 // ---------------------------------------------------------------------------
+// R9 / D10 — initialize response carries serverInfo.version matching
+// .zcode-plugin/plugin.json (single source of truth). Previously both
+// daemon.mjs and mcp-server.mjs hardcoded "0.1.0", drifting from the
+// manifest's "0.1.4". This pins the contract that MCP-level identify is
+// consistent with the manifest.
+//
+// Test design: read manifest version from disk; assert MCP initialize
+// response's serverInfo.version === that value.
+// ---------------------------------------------------------------------------
+
+test("MCP: initialize self-reports version === plugin.json version (R9/D10)", async () => {
+  const env = await buildTestEnv()
+  const child = registerChild(spawnMcp({ tmpDir: env.tmpDir, port: env.port, cfgPath: env.cfgPath, captureStderr: true }))
+
+  const initResp = await rpc(child, {
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } },
+  })
+  assert.equal(initResp.id, 1)
+
+  const manifestPath = path.join(PLUGIN_ROOT, ".zcode-plugin", "plugin.json")
+  const expectedVersion = JSON.parse(fs.readFileSync(manifestPath, "utf8")).version
+  assert.ok(expectedVersion && typeof expectedVersion === "string", "manifest version must be a non-empty string")
+  assert.ok(
+    initResp.result.serverInfo && typeof initResp.result.serverInfo.version === "string",
+    "serverInfo.version must be a string",
+  )
+  assert.equal(
+    initResp.result.serverInfo.version,
+    expectedVersion,
+    `serverInfo.version must equal plugin.json version (${expectedVersion})`,
+  )
+
+  child.kill()
+})
+
+// ---------------------------------------------------------------------------
 // Scenario 2 — compress tools/call with valid args returns acceptance text.
 // ---------------------------------------------------------------------------
 
@@ -431,11 +468,14 @@ test("MCP: dcp_stats returns formatted stats text (with a real upstream capture)
 })
 
 // ---------------------------------------------------------------------------
-// Scenario 5 — dcp_sweep goes through admin and persists a change to
-// lightState of the most recently active session.
+// Scenario 5 — dcp_sweep goes through admin and persists a sweepDirective
+// to the most-recent session's lightState. (Gate 1.5 B2: real sweep via
+// directive consumed on next request — the legacy behaviour of clearing
+// sweepToolCallIds is now legacy; sweepToolCallIds persists for the older
+// "user pre-seeded sweep ids" path.)
 // ---------------------------------------------------------------------------
 
-test("MCP: dcp_sweep calls admin endpoint and returns ok", async () => {
+test("MCP: dcp_sweep calls admin endpoint and writes sweepDirective", async () => {
   const env = await buildTestEnv()
   const child = registerChild(spawnMcp({ tmpDir: env.tmpDir, port: env.port, cfgPath: env.cfgPath, captureStderr: true }))
 
@@ -456,9 +496,11 @@ test("MCP: dcp_sweep calls admin endpoint and returns ok", async () => {
   fs.writeFileSync(path.join(lsDir, `${fakeFp}.json`), JSON.stringify({
     anchors: { context: [], turn: [], iter: [] },
     fetchCount: 0,
-    sweepToolCallIds: ["seed-id-1"],
+    sweepToolCallIds: [],
     decompressBlockIds: [],
     manualMode: false,
+    sweepDirective: null,
+    sweepLastResult: null,
   }), "utf8")
 
   const resp = await rpc(child, {
@@ -468,12 +510,14 @@ test("MCP: dcp_sweep calls admin endpoint and returns ok", async () => {
   assert.equal(resp.id, 40)
   assert.ok(resp.result, "expected result, got " + JSON.stringify(resp))
   const text = (resp.result.content || []).map((c) => c.text || "").join("\n")
-  assert.match(text, /sweep|ok|done|applied/i, `got: ${text}`)
+  assert.match(text, /sweep|accepted|will be applied/i, `got: ${text}`)
 
-  // After sweep, the light-state file should have sweepToolCallIds cleared
-  // (the admin handler empties the array).
+  // After sweep, the light-state file should have a since-user sweepDirective
+  // queued (the proxy will pick it up on the next /v1/messages request).
   const lsAfter = JSON.parse(fs.readFileSync(path.join(lsDir, `${fakeFp}.json`), "utf8"))
-  assert.deepEqual(lsAfter.sweepToolCallIds, [], `expected cleared, got: ${JSON.stringify(lsAfter.sweepToolCallIds)}`)
+  assert.ok(lsAfter.sweepDirective, `sweepDirective must be set; got ${JSON.stringify(lsAfter.sweepDirective)}`)
+  assert.equal(lsAfter.sweepDirective.mode, "since-user")
+  assert.equal(lsAfter.sweepDirective.n, null)
 
   child.kill()
 })
@@ -805,11 +849,14 @@ test("MCP: dcp_manual off survives concurrent calls (no rollback)", async () => 
 })
 
 // ---------------------------------------------------------------------------
-// dcp_decompress / dcp_recompress — additional tool coverage that was
-// documented in the brief but the v1 port skipped.
+// dcp_decompress / dcp_recompress — Gate 1.5 B3: list + single-block restore.
+//
+// `dcp_decompress` no-arg now lists available blocks (does NOT clear the
+// exclusion table). `blockId=N` writes N to decompressBlockIds (single writer).
+// `dcp_recompress` keeps its existing behaviour (clear + manualMode off).
 // ---------------------------------------------------------------------------
 
-test("MCP: dcp_decompress clears decompressBlockIds on the active session", async () => {
+test("MCP: dcp_decompress (no args) lists available blocks (does NOT clear)", async () => {
   const env = await buildTestEnv()
   const child = registerChild(spawnMcp({ tmpDir: env.tmpDir, port: env.port, cfgPath: env.cfgPath }))
 
@@ -828,8 +875,12 @@ test("MCP: dcp_decompress clears decompressBlockIds on the active session", asyn
     anchors: { context: [], turn: [], iter: [] },
     fetchCount: 0,
     sweepToolCallIds: [],
-    decompressBlockIds: ["b1", "b2", "b3"],
+    decompressBlockIds: [7, 8], // sentinel: must NOT be cleared by the list path
     manualMode: false,
+    activeBlockSummaries: [
+      { blockId: 1, topic: "Initial scan summary", approxTokens: 240 },
+      { blockId: 2, topic: "Second segment summary", approxTokens: 180 },
+    ],
   }), "utf8")
 
   const resp = await rpc(child, {
@@ -838,10 +889,97 @@ test("MCP: dcp_decompress clears decompressBlockIds on the active session", asyn
   })
   assert.ok(resp.result, "expected result, got " + JSON.stringify(resp))
   const text = (resp.result.content || []).map((c) => c.text || "").join("\n")
-  assert.match(text, /decompress applied/i, `got: ${text}`)
+  assert.match(text, /Usage:.*decompress/i, `expected Usage hint; got: ${text}`)
+  assert.match(text, /b1/, `expected b1 row; got: ${text}`)
+  assert.match(text, /b2/, `expected b2 row; got: ${text}`)
+  assert.match(text, /Initial scan summary/, `expected block 1 topic; got: ${text}`)
+  // Exclusion table must NOT be touched on the list path.
+  const lsAfter = JSON.parse(fs.readFileSync(lsFile, "utf8"))
+  assert.deepEqual(
+    lsAfter.decompressBlockIds, [7, 8],
+    `decompressBlockIds must NOT be cleared on the list path; got ${JSON.stringify(lsAfter.decompressBlockIds)}`,
+  )
+
+  child.kill()
+})
+
+test("MCP: dcp_decompress with blockId=N writes N to decompressBlockIds", async () => {
+  const env = await buildTestEnv()
+  const child = registerChild(spawnMcp({ tmpDir: env.tmpDir, port: env.port, cfgPath: env.cfgPath }))
+
+  await rpc(child, {
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } },
+  })
+
+  const activePath = path.join(env.tmpDir, "active-sessions.json")
+  const fakeFp = "0123456789abcdef"
+  fs.writeFileSync(activePath, JSON.stringify({ [fakeFp]: { lastSeenTs: Date.now() } }), "utf8")
+  const lsDir = path.join(env.tmpDir, "light-state")
+  fs.mkdirSync(lsDir, { recursive: true })
+  const lsFile = path.join(lsDir, `${fakeFp}.json`)
+  fs.writeFileSync(lsFile, JSON.stringify({
+    anchors: { context: [], turn: [], iter: [] },
+    fetchCount: 0,
+    sweepToolCallIds: [],
+    decompressBlockIds: [],
+    manualMode: false,
+    // I-2 (review r2): the daemon's existence check looks up the requested
+    // blockId in activeBlockSummaries. Seed block 2 so the positive path
+    // stays green.
+    activeBlockSummaries: [
+      { blockId: 2, topic: "Second segment summary", approxTokens: 180 },
+    ],
+  }), "utf8")
+
+  const resp = await rpc(child, {
+    jsonrpc: "2.0", id: 61, method: "tools/call",
+    params: { name: "dcp_decompress", arguments: { blockId: 2 } },
+  })
+  assert.ok(resp.result, "expected result, got " + JSON.stringify(resp))
+  const text = (resp.result.content || []).map((c) => c.text || "").join("\n")
+  assert.match(text, /Restored compression b2/i, `expected restore confirmation; got: ${text}`)
 
   const lsAfter = JSON.parse(fs.readFileSync(lsFile, "utf8"))
-  assert.deepEqual(lsAfter.decompressBlockIds, [], `decompressBlockIds should be cleared; got ${JSON.stringify(lsAfter.decompressBlockIds)}`)
+  assert.deepEqual(
+    lsAfter.decompressBlockIds, [2],
+    `decompressBlockIds must contain [2]; got ${JSON.stringify(lsAfter.decompressBlockIds)}`,
+  )
+
+  child.kill()
+})
+
+test("MCP: dcp_decompress with invalid blockId returns an error", async () => {
+  const env = await buildTestEnv()
+  const child = registerChild(spawnMcp({ tmpDir: env.tmpDir, port: env.port, cfgPath: env.cfgPath }))
+
+  await rpc(child, {
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } },
+  })
+
+  const activePath = path.join(env.tmpDir, "active-sessions.json")
+  const fakeFp = "0123456789abcdef"
+  fs.writeFileSync(activePath, JSON.stringify({ [fakeFp]: { lastSeenTs: Date.now() } }), "utf8")
+  const lsDir = path.join(env.tmpDir, "light-state")
+  fs.mkdirSync(lsDir, { recursive: true })
+  const lsFile = path.join(lsDir, `${fakeFp}.json`)
+  fs.writeFileSync(lsFile, JSON.stringify({
+    anchors: { context: [], turn: [], iter: [] },
+    fetchCount: 0,
+    sweepToolCallIds: [],
+    decompressBlockIds: [],
+    manualMode: false,
+  }), "utf8")
+
+  const resp = await rpc(child, {
+    jsonrpc: "2.0", id: 62, method: "tools/call",
+    params: { name: "dcp_decompress", arguments: { blockId: "abc" } },
+  })
+  // error envelope expected
+  assert.ok(resp.error, `expected error envelope; got ${JSON.stringify(resp)}`)
+  const lsAfter = JSON.parse(fs.readFileSync(lsFile, "utf8"))
+  assert.deepEqual(lsAfter.decompressBlockIds, [])
 
   child.kill()
 })
@@ -1112,6 +1250,299 @@ test("C-WRITE-3: server still accepts Content-Length framed input on stdin and r
   assert.ok(targetLine, `expected a line with id=1003; raw=${JSON.stringify(raw)}`)
   const parsed = JSON.parse(targetLine)
   assert.equal(parsed.result.serverInfo.name, "zcode-dcp")
+
+  child.kill()
+})
+
+// ---------------------------------------------------------------------------
+// R10 — SessionStart cold-start must bounded-wait (≤ 3s) and inject
+// DCP_BRIEFING via hookSpecificOutput.additionalContext when health flips
+// healthy mid-wait. Was: poll 5s, emit `{}` unconditionally.
+// SPEC R10 / DESIGN D6 / PLAN Task-7.
+//
+// Test design: spawn the real session-start.mjs with a controlled port
+// blocker. The blocker initially returns 404 (so hook sees unhealthy, takes
+// the cold-start branch + spawns launcher). 200ms in we flip the blocker
+// to "healthy" so the next probe sees 200 → hook should emit the briefing.
+// ---------------------------------------------------------------------------
+
+test("R10: cold-start bounded-wait — briefing injected when health flips healthy mid-wait", async () => {
+  const port = await getFreePort()
+  let healthy = false
+  const blocker = http.createServer((req, res) => {
+    if (req.url === "/dcp-admin/health") {
+      if (healthy) { res.statusCode = 200; res.end("ok") }
+      else { res.statusCode = 404; res.end("not yet") }
+    } else {
+      res.statusCode = 404; res.end()
+    }
+  })
+  await new Promise((resolve, reject) => {
+    blocker.once("error", reject)
+    blocker.listen(port, "127.0.0.1", resolve)
+  })
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-dcp-r10-"))
+  fs.mkdirSync(path.join(tmpDir, ".zcode"), { recursive: true })
+  fs.writeFileSync(
+    path.join(tmpDir, ".zcode", "dcp.jsonc"),
+    JSON.stringify({
+      proxy: { port, idleTimeoutMin: 30, adminTokenFile: "admin-token" },
+      upstream: { baseUrl: "http://127.0.0.1:1", apiKey: "x" },
+      compress: { mode: "range", permission: "allow" },
+    }, null, 2),
+    "utf8",
+  )
+
+  const start = Date.now()
+  const child = spawn(process.execPath, [path.join(PLUGIN_ROOT, "hooks", "session-start.mjs")], {
+    cwd: tmpDir,
+    env: {
+      ...process.env,
+      DCP_PLUGIN_ROOT: PLUGIN_ROOT,
+      DCP_PLUGIN_DATA: tmpDir,
+      DCP_DATA_DIR: tmpDir,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  })
+
+  // After 200ms, flip the blocker to "healthy" — hook should detect on next
+  // probe (probe interval is 250ms in the target design). 200ms is safely
+  // after the first probe (which sees 404) and before the 3s cap.
+  setTimeout(() => { healthy = true }, 200)
+
+  let stdout = ""
+  child.stdout.on("data", (d) => { stdout += d.toString("utf8") })
+  child.stderr.on("data", (d) => process.stderr.write("[R10-1 hook stderr] " + d.toString()))
+
+  const exitCode = await new Promise((resolve) => {
+    const t = setTimeout(() => { try { child.kill() } catch {} ; resolve("timeout") }, 8000)
+    child.on("exit", (code) => { clearTimeout(t); resolve(code) })
+  })
+  const elapsed = Date.now() - start
+  // Test diagnostic — harmless if it goes to stderr.
+  process.stderr.write(`[R10-1] exit=${exitCode} elapsed=${elapsed}ms stdout=${JSON.stringify(stdout.slice(0, 200))}\n`)
+
+  assert.equal(exitCode, 0, `hook exit code = ${exitCode}`)
+  let parsed
+  try { parsed = JSON.parse(stdout) } catch { parsed = null }
+  assert.ok(parsed, `hook stdout must be valid JSON; got: ${JSON.stringify(stdout)}`)
+  assert.ok(parsed.hookSpecificOutput, `expected hookSpecificOutput envelope; got: ${JSON.stringify(parsed)}`)
+  assert.equal(parsed.hookSpecificOutput.hookEventName, "SessionStart")
+  assert.ok(
+    typeof parsed.hookSpecificOutput.additionalContext === "string"
+      && parsed.hookSpecificOutput.additionalContext.length > 0,
+    `expected non-empty additionalContext; got: ${JSON.stringify(parsed.hookSpecificOutput)}`,
+  )
+  assert.match(
+    parsed.hookSpecificOutput.additionalContext,
+    /DCP active/,
+    `expected DCP_BRIEFING tagline; got first 200 chars: ${parsed.hookSpecificOutput.additionalContext.slice(0, 200)}`,
+  )
+  // Cold-start branch must have probed at least once before flipping (so the
+  // health branch on :130 didn't fire directly). Elapsed >= 100ms covers the
+  // first probe + spawn + flip latency.
+  assert.ok(elapsed >= 100, `cold-start should have probed first; elapsed=${elapsed}ms (too fast — likely took the already-healthy branch)`)
+  // And must not exceed the 3s cap by much (spawn overhead + 3s cap).
+  assert.ok(elapsed < 4000, `cold-start should bounded-wait within ~3s; elapsed=${elapsed}ms`)
+
+  blocker.close()
+})
+
+test("R10: cold-start bounded-wait — emits {} within ~3s when health never becomes healthy", async () => {
+  const port = await getFreePort()
+  // Blocker always returns 404 — hook sees persistent unhealthy, launcher
+  // can't bind (port occupied), so the cold-start loop probes 404 every tick
+  // until the 3s cap, then emits {}.
+  const blocker = http.createServer((req, res) => {
+    res.statusCode = 404; res.end("never")
+  })
+  await new Promise((resolve, reject) => {
+    blocker.once("error", reject)
+    blocker.listen(port, "127.0.0.1", resolve)
+  })
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-dcp-r10-"))
+  fs.mkdirSync(path.join(tmpDir, ".zcode"), { recursive: true })
+  fs.writeFileSync(
+    path.join(tmpDir, ".zcode", "dcp.jsonc"),
+    JSON.stringify({
+      proxy: { port, idleTimeoutMin: 30, adminTokenFile: "admin-token" },
+      upstream: { baseUrl: "http://127.0.0.1:1", apiKey: "x" },
+      compress: { mode: "range", permission: "allow" },
+    }, null, 2),
+    "utf8",
+  )
+
+  const start = Date.now()
+  const child = spawn(process.execPath, [path.join(PLUGIN_ROOT, "hooks", "session-start.mjs")], {
+    cwd: tmpDir,
+    env: {
+      ...process.env,
+      DCP_PLUGIN_ROOT: PLUGIN_ROOT,
+      DCP_PLUGIN_DATA: tmpDir,
+      DCP_DATA_DIR: tmpDir,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  })
+
+  let stdout = ""
+  child.stdout.on("data", (d) => { stdout += d.toString("utf8") })
+  child.stderr.on("data", (d) => process.stderr.write("[R10-2 hook stderr] " + d.toString()))
+
+  const exitCode = await new Promise((resolve) => {
+    const t = setTimeout(() => { try { child.kill() } catch {} ; resolve("timeout") }, 8000)
+    child.on("exit", (code) => { clearTimeout(t); resolve(code) })
+  })
+  const elapsed = Date.now() - start
+  process.stderr.write(`[R10-2] exit=${exitCode} elapsed=${elapsed}ms stdout=${JSON.stringify(stdout.slice(0, 100))}\n`)
+
+  assert.equal(exitCode, 0, `hook exit code = ${exitCode}`)
+  assert.equal(stdout.trim(), "{}", `expected {} on timeout; got: ${JSON.stringify(stdout)}`)
+  // 3s cap + spawn overhead — must be < 4s. (Was 5s in v0.1.4 — regression guard.)
+  assert.ok(elapsed < 4000, `elapsed should be < 4000ms (3s cap + overhead); got ${elapsed}ms`)
+  // Must reflect an actual bounded wait — not "skipped spawn, instant {}".
+  assert.ok(elapsed >= 2500, `elapsed should be >= 2500ms (actual 3s wait); got ${elapsed}ms`)
+
+  blocker.close()
+})
+
+// ---------------------------------------------------------------------------
+// R8.1 + R8.2 + R8.3 (task-8) — dcp_stats render uses the new wording:
+// "Savings rate" (NOT "Cache hit rate"), byStrategy rows labelled with
+// "hits" (per-request cumulative count, not token share), and a new
+// "Saved tokens by strategy" line that reads from stats.byStrategyTokens.
+// The legacy stats-all.json shape (no byStrategyTokens field) must still
+// render normally, with the tokens line omitted.
+//
+// We seed dataDir/stats-all.json directly so /dcp-admin/stats returns the
+// shape we want to test, then drive dcp_stats through MCP RPC and inspect
+// the rendered text.
+// ---------------------------------------------------------------------------
+
+/**
+ * Write a stats-all.json payload to the test data dir, then drive
+ * dcp_stats through the MCP server and resolve with the rendered text
+ * (or null on tool-call failure).
+ */
+async function renderStatsViaRpc(env, child, statsAll) {
+  fs.writeFileSync(
+    path.join(env.tmpDir, "stats-all.json"),
+    JSON.stringify(statsAll, null, 2),
+    "utf8",
+  )
+  const resp = await rpc(child, {
+    jsonrpc: "2.0", id: 80, method: "tools/call",
+    params: { name: "dcp_stats", arguments: {} },
+  })
+  if (!resp.result || !resp.result.content) return null
+  return (resp.result.content || []).map((c) => c.text || "").join("\n")
+}
+
+test("R8.1+R8.2: dcp_stats render uses 'Savings rate' label, byStrategy rows labelled 'hits' (new stats)", async () => {
+  const env = await buildTestEnv()
+  const child = registerChild(spawnMcp({ tmpDir: env.tmpDir, port: env.port, cfgPath: env.cfgPath, captureStderr: true }))
+
+  await rpc(child, {
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "r8", version: "0" } },
+  })
+  // Wait for daemon to come up so the admin token is materialised.
+  await new Promise((r) => setTimeout(r, 800))
+
+  // New-shape stats: includes byStrategyTokens.
+  const text = await renderStatsViaRpc(env, child, {
+    sentTokens: 1000, savedTokens: 250, requests: 4, compressRuns: 1,
+    byStrategy: { dedup: 3, purge: 1, sweep: 0, compress: 1 },
+    byStrategyTokens: { dedup: 180, purge: 40, sweep: 0, compress: 30 },
+    sessions: [],
+  })
+
+  assert.ok(text, "expected rendered text; got null")
+  assert.match(text, /Savings rate/i, `expected "Savings rate" label; got: ${text}`)
+  assert.doesNotMatch(text, /Cache hit rate/i, `legacy label must NOT appear; got: ${text}`)
+  assert.match(text, /hits/i, `byStrategy rows must be labelled "hits"; got: ${text}`)
+  assert.match(
+    text,
+    /Saved tokens by strategy/i,
+    `expected "Saved tokens by strategy" section; got: ${text}`,
+  )
+  // Spot-check the per-strategy token values are surfaced (180 dedup, 40 purge, 30 compress).
+  assert.match(text, /180/, `expected dedup tokens 180 in output; got: ${text}`)
+  assert.match(text, /40/, `expected purge tokens 40 in output; got: ${text}`)
+  assert.match(text, /30/, `expected compress tokens 30 in output; got: ${text}`)
+
+  child.kill()
+})
+
+test("R8.3: dcp_stats render omits 'Saved tokens by strategy' line for legacy stats without byStrategyTokens", async () => {
+  const env = await buildTestEnv()
+  const child = registerChild(spawnMcp({ tmpDir: env.tmpDir, port: env.port, cfgPath: env.cfgPath, captureStderr: true }))
+
+  await rpc(child, {
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "r8-legacy", version: "0" } },
+  })
+  await new Promise((r) => setTimeout(r, 800))
+
+  // Legacy shape: NO byStrategyTokens. Must still render correctly.
+  const text = await renderStatsViaRpc(env, child, {
+    sentTokens: 800, savedTokens: 200, requests: 3, compressRuns: 0,
+    byStrategy: { dedup: 2, purge: 0, sweep: 0, compress: 0 },
+    sessions: [],
+  })
+
+  assert.ok(text, "expected rendered text; got null")
+  // New wording still applied.
+  assert.match(text, /Savings rate/i, `expected "Savings rate"; got: ${text}`)
+  assert.match(text, /hits/i, `byStrategy rows must be labelled "hits"; got: ${text}`)
+  // Legacy token-share paragraph must NOT appear.
+  assert.doesNotMatch(
+    text,
+    /Strategy share \(of .* saved tokens\)/i,
+    `legacy "Strategy share (...)" line must NOT appear; got: ${text}`,
+  )
+  // The "Saved tokens by strategy" line MUST be omitted (no field to read).
+  assert.doesNotMatch(
+    text,
+    /Saved tokens by strategy/i,
+    `"Saved tokens by strategy" must be omitted when byStrategyTokens absent; got: ${text}`,
+  )
+  // Sanity: basic counters still render.
+  assert.match(text, /Requests:\s+3/, `expected Requests: 3; got: ${text}`)
+  assert.match(text, /Saved tokens:\s+200/, `expected Saved tokens: 200; got: ${text}`)
+
+  child.kill()
+})
+
+test("R8: dcp_stats render never contains legacy labels (zero-residual regression)", async () => {
+  const env = await buildTestEnv()
+  const child = registerChild(spawnMcp({ tmpDir: env.tmpDir, port: env.port, cfgPath: env.cfgPath, captureStderr: true }))
+
+  await rpc(child, {
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "r8-residual", version: "0" } },
+  })
+  await new Promise((r) => setTimeout(r, 800))
+
+  // New-shape with non-zero totalSavings (the case where legacy code emitted
+  // the "Strategy share (of N saved tokens)" paragraph).
+  const text = await renderStatsViaRpc(env, child, {
+    sentTokens: 500, savedTokens: 500, requests: 5, compressRuns: 1,
+    byStrategy: { dedup: 4, purge: 2, sweep: 0, compress: 1 },
+    byStrategyTokens: { dedup: 250, purge: 100, sweep: 0, compress: 50 },
+    sessions: [],
+  })
+
+  assert.ok(text, "expected rendered text; got null")
+  assert.doesNotMatch(text, /Cache hit rate/i, `legacy label MUST be absent; got: ${text}`)
+  assert.doesNotMatch(
+    text,
+    /Strategy share \(of .* saved tokens\)/i,
+    `legacy share paragraph MUST be absent; got: ${text}`,
+  )
 
   child.kill()
 })

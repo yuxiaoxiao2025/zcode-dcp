@@ -46,10 +46,14 @@ import {
   saveLightState,
   markActive,
 } from "./session.mjs"
-import { Stats, createDebugLogger } from "./stats.mjs"
+import { Stats, createDebugLogger, compressRunsDelta, appendRequestLine } from "./stats.mjs"
 import { estimateMessageTokens, estimateTokens } from "./tokens.mjs"
+import { getVersion } from "./version.mjs"
 
-const PLUGIN_VERSION = "0.1.0"
+// R9 / D10: single source of truth for the plugin version. Read once at
+// module load; if the manifest is unreadable the warn surfaces at startup
+// and we fall back to FALLBACK_VERSION inside getVersion().
+const PLUGIN_VERSION = getVersion()
 const SERVICE_NAME = "zcode-dcp"
 const ADMIN_PREFIX = "/dcp-admin/"
 
@@ -316,6 +320,25 @@ function locateMessagesSlice(bodyBuffer) {
  * estimateTokens across the JSON-stringified body for simplicity — this is
  * the same approximation DCP uses in lib/token-utils.ts when the official
  * Anthropic tokenizer is unavailable.
+ *
+ * Gate 1.5 A2: the estimator now counts THREE components on equal footing
+ *   * system   — string body or concatenated text blocks (unchanged)
+ *   * tools    — sum of estimateTokens(JSON.stringify(tool)) for each
+ *                tool definition. Pre-fix this component was MISSING,
+ *                so the displayed "sent" missed the tool-definition bytes
+ *                that DO count toward the upstream-billed token count
+ *                (~28.8% of a typical session per the 08 root-cause
+ *                replay). The estimator convention here matches the
+ *                token-side: tokens.mjs's `tool_use` block estimator
+ *                uses `estimateTokens(JSON.stringify(block))` — i.e.
+ *                "whole block serialized". Tool definitions and tool_use
+ *                blocks are the same conceptual surface (an MCP / Anthropic
+ *                tool declaration), so they get the same estimator.
+ *   * messages — estimateMessageTokens over each message (unchanged)
+ *
+ * Symmetry guarantee: this function feeds BOTH `stats.incr("sentTokens")`
+ * AND the per-request jsonl `sent` field in appendRequestLine — a single
+ * change here keeps the two surfaces in lock-step, no extra wiring.
  */
 function estimateBodyTokens(bodyBuffer) {
   try {
@@ -330,6 +353,17 @@ function estimateBodyTokens(bodyBuffer) {
       for (const b of parsed.system) {
         if (b && typeof b === "object" && typeof b.text === "string") {
           total += estimateTokens(b.text)
+        }
+      }
+    }
+    // Tool definitions (the A2 fix). Each tool is one entry on body.tools;
+    // their full JSON shape contributes to the upstream-billed prompt
+    // tokens, so we count the whole serialised definition. An empty / missing
+    // tools array contributes 0 (boundary case pinned by A2.②).
+    if (Array.isArray(parsed.tools)) {
+      for (const tool of parsed.tools) {
+        if (tool && typeof tool === "object") {
+          total += estimateTokens(JSON.stringify(tool))
         }
       }
     }
@@ -417,11 +451,77 @@ async function handleMessages(req, res, shared, rawBody) {
     if (typeof bs.compress === "number") stats.incr("byStrategy.compress", bs.compress)
     if (typeof bs.sweep === "number") stats.incr("byStrategy.sweep", bs.sweep)
   }
+  // R8.3 / DESIGN D3: per-strategy TOKEN split. Feed each bucket from
+  // metrics.savedTokensByStrategy so the all-time aggregate carries the
+  // split alongside the total savedTokens (the four buckets sum to
+  // savedTokensEst by construction; see pipeline.mjs).
+  if (transformResult.metrics && transformResult.metrics.savedTokensByStrategy) {
+    const bst = transformResult.metrics.savedTokensByStrategy
+    if (typeof bst.dedup === "number") stats.incr("byStrategyTokens.dedup", bst.dedup)
+    if (typeof bst.purge === "number") stats.incr("byStrategyTokens.purge", bst.purge)
+    if (typeof bst.sweep === "number") stats.incr("byStrategyTokens.sweep", bst.sweep)
+    if (typeof bst.compress === "number") stats.incr("byStrategyTokens.compress", bst.compress)
+  }
+  // R3 / DESIGN D2: compressRuns = (本次 maxRunId - lightState.maxRunIdSeen)
+  // 仅当 maxRunId > seen 且本请求无 compressError 时递增；首见（seen=null）
+  // 建立基线但不计数。compressError 请求既不 incr 也不推进 seen。
+  const compressError = !!(transformResult.metrics && transformResult.metrics.compressError)
+  const maxRunIdNow = (transformResult.metrics && Number.isFinite(transformResult.metrics.maxRunId))
+    ? transformResult.metrics.maxRunId
+    : 0
+  const seenPrior = Number.isFinite(lightState.maxRunIdSeen) ? lightState.maxRunIdSeen : null
+  const compressRunsDeltaValue = compressRunsDelta(maxRunIdNow, seenPrior, compressError)
+  if (compressRunsDeltaValue > 0) {
+    stats.incr("compressRuns", compressRunsDeltaValue)
+  }
   try {
     stats.snapshot()
   } catch (err) {
     if (shared.logger) shared.logger.log("warn", "stats snapshot failed: " + (err && err.message))
   }
+  // R8.3 / DESIGN D3a: per-request jsonl record. Async fire-and-forget —
+  // the request-forwarding path is NOT blocked by stats I/O. appendRequestLine
+  // swallows its own write failures internally, so the only failure mode
+  // that reaches this catch is a programmer error (e.g. promise reject from
+  // a future refactor). On any rejection we warn and proceed.
+  try {
+    const rec = {
+      ts: Date.now(),
+      fp,
+      sent: estimateBodyTokens(forwardedBody),
+      saved: (transformResult.metrics && typeof transformResult.metrics.savedTokensEst === "number")
+        ? transformResult.metrics.savedTokensEst
+        : 0,
+      byStrategy: transformResult.metrics && transformResult.metrics.byStrategy
+        ? transformResult.metrics.byStrategy
+        : { dedup: 0, purge: 0, sweep: 0, compress: 0 },
+      byStrategyTokens: transformResult.metrics && transformResult.metrics.savedTokensByStrategy
+        ? transformResult.metrics.savedTokensByStrategy
+        : { dedup: 0, purge: 0, sweep: 0, compress: 0 },
+    }
+    // Note: do NOT await — the async I/O runs on the libuv pool and the
+    // response is forwarded in step 7 below without blocking on this write.
+    appendRequestLine(shared.dataDir, rec).catch((err) => {
+      if (shared.logger) shared.logger.log(
+        "warn",
+        "appendRequestLine rejected: " + (err && err.message),
+      )
+    })
+  } catch (err) {
+    if (shared.logger) shared.logger.log(
+      "warn",
+      "appendRequestLine setup failed: " + (err && err.message),
+    )
+  }
+  // DESIGN D2 known window: stats.snapshot() (writes stats/{fp}.json +
+  // stats-all.json) and saveLightState() (writes light-state/{fp}.json)
+  // below are NOT atomic across files. A crash between the two leaves the
+  // compressRuns counter advanced while maxRunIdSeen stays stale (or vice
+  // versa). On the next request the daemon re-reads lightState.maxRunIdSeen
+  // and recomputes delta — at worst one request double-counts by 1 or
+  // misses a delta. This is the documented R3/D2 cross-file window
+  // (DESIGN.md:90 "stats.snapshot 与 saveLightState 跨文件非原子"), low-risk
+  // accepted; a coordinated rename would require a manifest.
 
   // 6. Mark active + save light state (if pipeline returned updates).
   try { markActive(shared.dataDir, fp) } catch (err) {
@@ -429,6 +529,18 @@ async function handleMessages(req, res, shared, rawBody) {
   }
   if (transformResult.lightStateUpdates) {
     const merged = { ...lightState, ...transformResult.lightStateUpdates }
+    // R3 / DESIGN D2: persist maxRunIdSeen so the next request can compute
+    // the delta. We update ONLY when (a) this request observed a real maxRunId
+    // (no compressError) AND (b) maxRunId > 0 AND (c) maxRunId > current seen
+    // (or seen is null = first-seen). This is the "monotonic clamp":
+    //   - replays (maxRunId <= seen) do not roll the baseline back,
+    //   - errored requests (compressError=true) do not advance it,
+    //   - first-seen (seen===null) lands HERE as a baseline write — no
+    //     compressRuns counter change because compressRunsDelta already
+    //     returned 0 for the null-seen branch above.
+    if (!compressError && maxRunIdNow > 0 && (seenPrior === null || maxRunIdNow > seenPrior)) {
+      merged.maxRunIdSeen = maxRunIdNow
+    }
     try { saveLightState(shared.dataDir, fp, merged) } catch (err) {
       if (shared.logger) shared.logger.log("warn", `saveLightState failed for fp=${fp}: ${err && err.message}`)
     }
@@ -543,8 +655,53 @@ function markActivity(shared) {
   scheduleIdleCheck(shared)
 }
 
+/**
+ * Resolve `proxy.idleTimeoutMin` (minutes) to milliseconds, applying R6
+ * semantics. Pure function — exported so tests can pin the contract
+ * independently of the daemon lifecycle.
+ *
+ *   0  → Infinity   (R6 documented opt-out: daemon runs forever, idle
+ *                    close is never scheduled. Caller must short-circuit
+ *                    before setTimeout because `setTimeout(fn, Infinity)`
+ *                    fires ~immediately.)
+ *   +N → N * 60_000 (normal minutes→ms conversion, floor-clamped to ≥1
+ *                    minute to avoid silly sub-minute values.)
+ *   NaN / negative / non-finite / non-number (other than undefined/null)
+ *                 → 1_800_000 + console.warn (30-min default + operator-
+ *                    visible signal that the config value is bad).
+ *   undefined / null → 1_800_000 silently (field simply not set — the
+ *                    common case for new installs; not worth a warn).
+ *
+ * @param {*} min — minutes value from config (or undefined if unset)
+ * @returns {number} milliseconds, or `Infinity` for the never-close case
+ */
+export function resolveIdleTimeoutMs(min) {
+  // R6: 0 means forever. Documented opt-out, no warn.
+  if (min === 0) return Infinity
+  // Valid positive minutes.
+  if (typeof min === "number" && Number.isFinite(min) && min > 0) {
+    return Math.max(1, Math.floor(min)) * 60 * 1000
+  }
+  // Field simply not set (common) — silent fallback to 30-min default.
+  if (min === undefined || min === null) {
+    return 30 * 60 * 1000
+  }
+  // Explicit invalid value (NaN, negative, non-finite, non-number) —
+  // warn the operator, fall back to default.
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[daemon] invalid proxy.idleTimeoutMin=${min}; falling back to 30 minutes`,
+  )
+  return 30 * 60 * 1000
+}
+
 function scheduleIdleCheck(shared) {
   if (!shared.idleTimeoutMs) return
+  // R6: idleTimeoutMin=0 → resolveIdleTimeoutMs returns Infinity → never
+  // schedule a close. setTimeout(fn, Infinity) on Node.js fires essentially
+  // immediately (it clamps to ~1ms), so we MUST skip the call entirely
+  // rather than pass Infinity as the delay.
+  if (shared.idleTimeoutMs === Infinity) return
   if (shared.idleTimer) {
     clearTimeout(shared.idleTimer)
     shared.idleTimer = null
@@ -725,19 +882,35 @@ function handleAdminStateAction(req, res, shared, action, queryParams) {
     return
   }
   if (action === "sweep") {
-    // Mark all currently-resolvable tool_use ids as "sweep" — the pipeline
-    // will see lightState.sweepToolCallIds and merge them into the prune
-    // set on the next request. (Re-derived from messages each pass.)
-    const sweepIds = []
-    const arr = Array.isArray(ls.anchors && ls.anchors.context) ? ls.anchors.context : []
-    // The sweep set is recomputed each request from the messages; here we
-    // just signal "re-derive now" by clearing the dedup cache anchor and
-    // letting the pipeline's planPrune recompute. The MCP `sweep` tool
-    // passes the explicit ids; the admin endpoint acts as the manual sweep
-    // trigger — its effect is "drop any dedup cache hits on next pass".
-    if (!Array.isArray(ls.sweepToolCallIds)) ls.sweepToolCallIds = []
-    ls.sweepToolCallIds.length = 0 // reset so the next pipeline pass re-runs
-    void sweepIds
+    // Gate 1.5 B2 — real sweep via directive consumed on next request.
+    //
+    // Parse `?n=<positive-int>` (DCP sweep.ts:139-140). No-arg → since-user
+    // mode (DCP default). Invalid (non-numeric / non-positive / negative)
+    // → 400 — we deliberately do NOT silently ignore bad input because
+    // operators need to spot typos (I-1 contract).
+    const nRaw = queryParams && queryParams.n
+    let mode = "since-user"
+    let n = null
+    if (nRaw !== undefined && nRaw !== "") {
+      const parsed = Number(nRaw)
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+        sendJson(res, 400, {
+          error: "invalid_sweep_n",
+          message: "sweep?n= expects a positive integer; got " + JSON.stringify(nRaw),
+        })
+        return
+      }
+      mode = "last-n"
+      n = parsed
+    }
+    ls.sweepDirective = {
+      mode,
+      n,
+      // requestedAt is wall-clock for operator-visible ordering when multiple
+      // directives stack (currently only one is queued; future pipelines may
+      // batch multiple).
+      requestedAt: shared.now(),
+    }
   } else if (action === "manual") {
     // I-2 (task-13 fix): accept an optional `?enabled=true|false` query param
     // (set by MCP `dcp_manual` tool) so the daemon itself becomes the
@@ -757,11 +930,145 @@ function handleAdminStateAction(req, res, shared, action, queryParams) {
       ls.manualMode = v === "true" || v === "1" || v === "on"
     }
   } else if (action === "decompress") {
-    // CAP-20 decompress: clear the operator's exclusion list so future
-    // passes re-derive all blocks. The pipeline reads
-    // lightState.decompressBlockIds via deriveBlocks(messages, refs, cfg, {excludedBlockIds}).
+    // Gate 1.5 B3 — decompress list + single-block restore.
+    //
+    // DCP upstream behaviour (lib/commands/decompress.ts):
+    //   * no-arg  → list available blocks (displayId + tokens + topic).
+    //   * with N  → restore block N (target.active=false). The proxy port
+    //               has no in-memory message store so "restore" is
+    //               implemented as "add N to the exclusion list" — the
+    //               pipeline then DROPS the synthetic summary for N at
+    //               deriveBlocks, and the original covered span survives
+    //               verbatim in the next request.
+    //
+    // Behaviour change vs. v0.1.4 (declared in CAPABILITY-MAPPING row 2):
+    //   * v0.1.4: no-arg cleared the entire exclusion table. Recompress
+    //     still does that, and remains the operator's "restore all" lever.
+    //   * v0.1.5 (B3): no-arg now lists them (non-destructive on the
+    //     exclusion table).
+    //
+    // Multi-value `blockId` is accepted: `?blockId=2&blockId=3` writes
+    // both. Duplicate adds collapse (single set semantics).
+    //
+    // Invalid (non-numeric / non-positive integer) → 400 with the precise
+    // error from the I-1 contract (the operator must be able to spot
+    // typos). The exclusion table is NOT mutated on the validation
+    // failure path.
+    const blockIdsRaw = queryParams && queryParams.blockId
+    const blockIdsProvided = blockIdsRaw !== undefined && blockIdsRaw !== ""
+    if (!blockIdsProvided) {
+      // List path — render the available-blocks text and respond with
+      // text/plain (matches DCP formatAvailableBlocksMessage semantics).
+      // The exclusion table is NOT touched on this path.
+      const summaries = Array.isArray(ls.activeBlockSummaries) ? ls.activeBlockSummaries : []
+      const lines = []
+      lines.push("Usage: /dcp decompress <n>")
+      lines.push("")
+      if (summaries.length === 0) {
+        lines.push("No compressions are available to restore.")
+      } else {
+        lines.push("Available compressions:")
+        for (const s of summaries) {
+          const blockId = s && Number.isInteger(s.blockId) ? s.blockId : 0
+          const approxTokens = s && Number.isFinite(s.approxTokens) ? s.approxTokens : 0
+          const topic = s && typeof s.topic === "string" && s.topic.length > 0 ? s.topic : "(no topic)"
+          lines.push(`  b${blockId} (~${approxTokens} tokens) - ${topic}`)
+        }
+      }
+      const text = lines.join("\n")
+      sendText(res, 200, text)
+      return
+    }
+    // Multi-value handling: queryParams.blockId is a string when only one
+    // query key was sent and an array when multiple — node's http module
+    // exposes only string values, but our admin parser above coerces
+    // repeats to last-write-wins. To accept `?blockId=2&blockId=3`
+    // we re-parse from the raw url here.
+    const tail = (req && req.url) || ""
+    const qsIdx = tail.indexOf("?")
+    let blockIdsList = []
+    if (qsIdx >= 0) {
+      const qs = tail.slice(qsIdx + 1)
+      for (const pair of qs.split("&")) {
+        if (!pair) continue
+        const eq = pair.indexOf("=")
+        const k = eq === -1 ? pair : pair.slice(0, eq)
+        const v = eq === -1 ? "" : pair.slice(eq + 1)
+        if (k !== "blockId") continue
+        let decoded
+        try { decoded = decodeURIComponent(v) } catch { decoded = v }
+        blockIdsList.push(decoded)
+      }
+    }
+    if (blockIdsList.length === 0) blockIdsList = [blockIdsRaw]
+    const parsed = []
+    for (const raw of blockIdsList) {
+      const n = Number(raw)
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+        sendJson(res, 400, {
+          error: "invalid_block_id",
+          message: "decompress?blockId expects a positive integer; got " + JSON.stringify(raw),
+        })
+        return
+      }
+      parsed.push(n)
+    }
     if (!Array.isArray(ls.decompressBlockIds)) ls.decompressBlockIds = []
-    ls.decompressBlockIds.length = 0
+    // I-2 (review r2): existence validation. The pipeline writes
+    // lightState.activeBlockSummaries on every request (rebuilt fresh from
+    // activeBlocks after exclusion), so the entries there ARE the
+    // operator-visible notion of "currently active". Silently accepting
+    // `?blockId=999` would produce a fake "Restored compression b999…"
+    // confirmation for a block the operator never saw. Reject any id that
+    // does not appear in the current activeBlockSummaries list. The wording
+    // mirrors DCP upstream's "Compression N does not exist." (decompress.ts
+    // :196-197), adapted to the proxy's active-set-only world.
+    const activeBlockSummaries = Array.isArray(ls.activeBlockSummaries) ? ls.activeBlockSummaries : []
+    const activeIds = new Set(
+      activeBlockSummaries
+        .map((s) => (s && Number.isInteger(s.blockId) ? s.blockId : null))
+        .filter((x) => x !== null),
+    )
+    const invalid = parsed.filter((n) => !activeIds.has(n))
+    if (invalid.length > 0) {
+      sendJson(res, 400, {
+        error: "block_not_active",
+        message: `Compression b${invalid[0]} does not exist or is not currently active. Run /dcp-decompress with no args to list available blocks.`,
+        invalidIds: invalid,
+        availableIds: [...activeIds],
+      })
+      return
+    }
+    const seen = new Set(ls.decompressBlockIds)
+    for (const n of parsed) {
+      if (!seen.has(n)) {
+        ls.decompressBlockIds.push(n)
+        seen.add(n)
+      }
+    }
+    // BlockId path — render confirmation text and respond with text/plain
+    // (matches DCP upstream's "Restored compression bN" message shape). The
+    // MCP layer surfaces the text verbatim — see mcp-server.mjs dcp_decompress.
+    try {
+      saveLightState(shared.dataDir, latestFp, ls)
+    } catch (err) {
+      if (shared.logger) shared.logger.log("warn",
+        `saveLightState failed for fp=${latestFp}: ${err && err.message}`)
+      sendJson(res, 500, { error: "save_state_failed", message: err && err.message })
+      return
+    }
+    const confirmLines = []
+    if (parsed.length === 1) {
+      confirmLines.push(`Restored compression b${parsed[0]}. Original messages return on the next request.`)
+    } else {
+      // Multi-value path — neutral wording (M-4 review). The "nested" label
+      // in earlier drafts overpromised; the proxy does not implement DCP's
+      // findActiveAncestorBlockId semantics, so we report only what we did.
+      const ids = parsed.map((n) => `b${n}`).join(", ")
+      confirmLines.push(`Restored ${parsed.length} compression(s): ${ids}. Original messages return on the next request.`)
+    }
+    sendText(res, 200, confirmLines.join("\n"))
+    return
   } else if (action === "recompress") {
     ls.decompressBlockIds = []
     ls.manualMode = false
@@ -876,9 +1183,7 @@ export async function startDaemon({ config, dataDir }) {
   shared.dataDir = dataDir
   shared.config = config
   shared.logger = createDebugLogger(dataDir, !!(config && config.debug))
-  shared.idleTimeoutMs = (config.proxy && config.proxy.idleTimeoutMin)
-    ? Math.max(1, Math.floor(config.proxy.idleTimeoutMin)) * 60 * 1000
-    : 30 * 60 * 1000
+  shared.idleTimeoutMs = resolveIdleTimeoutMs(config.proxy && config.proxy.idleTimeoutMin)
   // I-4: admin probe timeout. Stored on shared so handleAdminStateAction
   // and the EADDRINUSE path can reach it. Default 1500ms (configurable).
   shared.adminProbeTimeoutMs = (config.proxy && Number.isFinite(config.proxy.adminProbeTimeoutMs))

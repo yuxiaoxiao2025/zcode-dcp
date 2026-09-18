@@ -42,13 +42,13 @@
                     "items": {
                         "type": "string"
                     },
-                    "default": [],
-                    "description": "Additional tool names or wildcard patterns to protect from pruning via commands (e.g., /dcp sweep). Supports glob wildcards: * matches any characters, ? matches a single character (e.g., \"mcp_*\", \"my_tool_?\")"
+                    "default": ["task", "skill", "todowrite", "todoread", "compress", "batch", "plan_enter", "plan_exit", "write", "edit"],
+                    "description": "Tool names or wildcard patterns to protect from commands like /dcp sweep. Defaults to the DCP v3.1.15 10-tool list (task / skill / todowrite / todoread / compress / batch / plan_enter / plan_exit / write / edit). Patterns are matched against the bare tool name with MCP prefix stripped, case-insensitively on exact matches; globs retain case. Glob wildcards supported: * matches any characters, ? matches a single character (e.g., \"mcp_*\", \"my_tool_?\")."
                 }
             },
             "default": {
                 "enabled": true,
-                "protectedTools": []
+                "protectedTools": ["task", "skill", "todowrite", "todoread", "compress", "batch", "plan_enter", "plan_exit", "write", "edit"]
             }
         },
         "manualMode": {
@@ -161,7 +161,7 @@
                 },
                 "minContextLimit": {
                     "description": "Soft lower threshold for reminder nudges. Below this, turn/iteration reminders are off (compression is less likely). At or above this, reminders are on. Accepts number or \"X%\" of the model context window.",
-                    "default": 50000,
+                    "default": 30000,
                     "oneOf": [
                         {
                             "type": "number"
@@ -245,7 +245,7 @@
                 "showCompression": false,
                 "summaryBuffer": true,
                 "maxContextLimit": 100000,
-                "minContextLimit": 50000,
+                "minContextLimit": 30000,
                 "nudgeFrequency": 5,
                 "iterationNudgeThreshold": 15,
                 "nudgeForce": "soft",

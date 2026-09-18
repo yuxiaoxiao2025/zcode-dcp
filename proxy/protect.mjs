@@ -4,16 +4,17 @@
 // Copyright (c) Opencode-DCP authors. Licensed under AGPL-3.0-or-later.
 //
 // ZCode adaptations (per port-opencode-dcp-to-zcode PLAN Task 3, H1/H5):
-//   - DEFAULT_PROTECTED_TOOLS: ZCode tool-name mapping. DCP's lowercase opencode
-//     names ('task','todowrite','todoread') are mapped to ZCode's PascalCase
-//     ('Task','TodoWrite','TodoRead'). ZCode-specific tools added: 'Agent' (the
-//     sub-agent invocation tool, distinct from Task), 'Skill', 'Write', 'Edit'.
-//     opencode-only entries (batch/plan_enter/plan_exit) are dropped — they
-//     have no ZCode equivalent. The compress tool name is matched dynamically
-//     by callers via a glob like 'mcp__*__compress', so it is NOT listed here.
 //   - COMPRESS_PROTECTED_TOOLS: subset used by the compress pipeline (per-task
 //     append), aligned to the DCP default of task/skill/todowrite/todoread with
-//     the same ZCode name mapping.
+//     the same ZCode name mapping. (The historical `DEFAULT_PROTECTED_TOOLS`
+//     ZCode-named list was removed in R2: it was never consumed by any
+//     production code path — DCP's same-named default feeds the sweep
+//     commands.protectedTools gate, not the dedup protection gate, so
+//     shipping it here only misled the README. The dedup-path default is
+//     empty, matching DCP. The hardcoded dedup output-substitution
+//     skip-list lives in prune.mjs as `SKIP_TOOLS` — it is the only
+//     "default" the dedup pipeline applies, and it is module-private
+//     except for the exported constant used by tests.)
 //   - getFilePathsFromParameters: only the common ZCode parameter keys
 //     ('file_path', 'path') are recognised. DCP's opencode-only branches
 //     (apply_patch patchText extraction, multiedit nested edits) are removed
@@ -35,19 +36,6 @@
 //         config.internalAgentSignatures.
 
 // ---------- Default protected tool lists (ZCode name mapping) ----------
-
-export const DEFAULT_PROTECTED_TOOLS = [
-    "Agent", // ZCode sub-agent invocation (DCP: 'task')
-    "Task", // ZCode Task (background / dispatch)
-    "Skill", // ZCode Skill execution
-    "TodoWrite", // ZCode todo write (DCP: 'todowrite')
-    "TodoRead", // ZCode todo read (DCP: 'todoread')
-    "Write", // ZCode file write
-    "Edit", // ZCode file edit
-    // compress tool name is NOT listed here; callers pass it dynamically
-    // (e.g. patterns = [...DEFAULT_PROTECTED_TOOLS, 'mcp__dcp__compress'])
-    // so the same default works regardless of MCP server name.
-]
 
 export const COMPRESS_PROTECTED_TOOLS = [
     "Agent",
@@ -198,8 +186,28 @@ export function isToolNameProtected(toolName, patterns) {
         }
     }
 
+    // Gate 1.5 B2: case-insensitive exact-name matching.
+    //
+    // The DCP upstream default commands.protectedTools are lowercase
+    // ("task", "skill", "write", "edit", "todowrite", ...) — opencode emits
+    // tool names in lowercase. ZCode emits them in PascalCase ("Write",
+    // "Edit", "TodoWrite", ...). A naive case-sensitive Set.has() check
+    // silently disables the protected-tools gate for every ZCode name
+    // (the exact bug the design called out).
+    //
+    // Glob patterns retain case (matchesGlob is anchored and literal-char
+    // sensitive in its non-wildcard segments); only exact patterns are
+    // case-folded. This preserves the original case-sensitive glob
+    // behaviour while letting the lowercase defaults match PascalCase
+    // runtime names.
+    const exactPatternsLower = new Set()
+    for (const p of exactPatterns) exactPatternsLower.add(p.toLowerCase())
+    const toolLower = stripMcpPrefix(String(toolName)).toLowerCase()
+    const fullLower = String(toolName).toLowerCase()
+
     // 1. Try the full name (preserves explicit full-name matches)
     if (exactPatterns.has(toolName)) return true
+    if (exactPatternsLower.has(fullLower)) return true
     if (globPatterns.some((pattern) => matchesGlob(toolName, pattern))) return true
 
     // 2. Strip MCP `mcp__<server>__` prefix and try the bare tool name.
@@ -214,6 +222,8 @@ export function isToolNameProtected(toolName, patterns) {
     if (mcpPrefixMatch) {
         const bare = mcpPrefixMatch[1]
         if (exactPatterns.has(bare)) return true
+        if (exactPatternsLower.has(bare.toLowerCase())) return true
+        if (exactPatternsLower.has(toolLower)) return true
         if (globPatterns.some((pattern) => matchesGlob(bare, pattern))) return true
     }
 

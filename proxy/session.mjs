@@ -125,6 +125,33 @@ export function defaultLightState() {
     sweepToolCallIds: [],
     decompressBlockIds: [],
     manualMode: false,
+    // R3 / DESIGN D2: null = first-seen baseline (daemon will write the
+    // observed maxRunId without incrementing compressRuns). On subsequent
+    // requests the daemon reads this and computes
+    //   compressRunsDelta(currentMaxRunId, maxRunIdSeen, !!compressError)
+    // — see stats.mjs:compressRunsDelta for the contract.
+    maxRunIdSeen: null,
+    // Gate 1.5 B2: one-shot sweep directive written by the daemon's
+    // /dcp-admin/state/sweep action and consumed by the pipeline on the
+    // NEXT inbound request. Null = no pending directive. ZCode-specific
+    // adaptation — DCP applies sweep immediately in the handler (state is
+    // mutable across calls), but the proxy is stateless across requests, so
+    // the directive is queued and applied when messages are next visible.
+    // Shape: { mode: "since-user" | "last-n", n: number | null, requestedAt: number }.
+    sweepDirective: null,
+    // Last applied sweep accounting (filled by the pipeline after consuming
+    // a directive; null otherwise). The MCP server reads this to surface
+    // "Last sweep: applied N, M protected skipped" on the next dcp_sweep
+    // call. Shape: { applied: number, skippedProtected: number }.
+    sweepLastResult: null,
+    // Gate 1.5 B3: per-fp summary of active compress blocks, written by the
+    // pipeline every request so the MCP server can render a "list available
+    // blocks" view via /dcp-admin/state/decompress (no-arg). The daemon does
+    // NOT persist these — they're recomputed on each request, so a stale
+    // summary cannot survive a process restart. Shape:
+    //   [{ blockId: number, topic: string, approxTokens: number }]
+    // Consumers: daemon.mjs (no-arg list response), MCP server (render text).
+    activeBlockSummaries: [],
   }
 }
 
@@ -149,7 +176,72 @@ function normalizeLightState(raw) {
     sweepToolCallIds: Array.isArray(raw.sweepToolCallIds) ? raw.sweepToolCallIds.slice() : def.sweepToolCallIds.slice(),
     decompressBlockIds: Array.isArray(raw.decompressBlockIds) ? raw.decompressBlockIds.slice() : def.decompressBlockIds.slice(),
     manualMode: typeof raw.manualMode === "boolean" ? raw.manualMode : def.manualMode,
+    // R3 / DESIGN D2: maxRunIdSeen is the baseline for compressRuns delta
+    // counting. null = first-seen (no prior state); a finite positive
+    // integer = last observed maxRunId. sanitize just enforces type
+    // coherence; the daemon writes this via the existing
+    // lightStateUpdates → saveLightState channel.
+    maxRunIdSeen: Number.isFinite(raw.maxRunIdSeen) ? raw.maxRunIdSeen : null,
+    // Gate 1.5 B2: backwards-compatible. Legacy light-state files lack
+    // sweepDirective / sweepLastResult entirely; default to null.
+    sweepDirective: normalizeSweepDirective(raw.sweepDirective),
+    sweepLastResult: normalizeSweepLastResult(raw.sweepLastResult),
+    // Gate 1.5 B3: backwards-compatible. Legacy files lack
+    // activeBlockSummaries entirely; coerce anything that is not a plain
+    // array of well-formed entries back to []. The pipeline RE-WRITES this
+    // field on every request, so a bad on-disk value is self-healing.
+    activeBlockSummaries: normalizeActiveBlockSummaries(raw.activeBlockSummaries),
   }
+}
+
+/**
+ * Sanitize an activeBlockSummaries value. Shape contract:
+ *   [{ blockId: number > 0, topic: string, approxTokens: number >= 0 }, ...]
+ * Anything that fails the type check (non-array, missing keys, wrong types)
+ * returns []. Defensive against on-disk corruption — the pipeline will
+ * overwrite on the next request anyway.
+ */
+function normalizeActiveBlockSummaries(v) {
+  if (!Array.isArray(v)) return []
+  const out2 = []
+  for (const entry of v) {
+    if (!entry || typeof entry !== "object") continue
+    const blockId = Number(entry.blockId)
+    const topic = typeof entry.topic === "string" ? entry.topic : ""
+    const approxTokens = Number(entry.approxTokens)
+    if (!Number.isInteger(blockId) || blockId <= 0) continue
+    if (!Number.isFinite(approxTokens) || approxTokens < 0) continue
+    out2.push({ blockId, topic, approxTokens })
+  }
+  return out2
+}
+
+/**
+ * Sanitize a sweepDirective value. Shape contract:
+ *   { mode: "since-user" | "last-n", n: number | null, requestedAt: number }
+ * Anything that fails the type check returns null (treated as "no directive"
+ * by the pipeline). Defensive against malformed on-disk values from a future
+ * schema migration that the running daemon cannot parse.
+ */
+function normalizeSweepDirective(v) {
+  if (!v || typeof v !== "object") return null
+  const mode = v.mode === "since-user" || v.mode === "last-n" ? v.mode : null
+  if (!mode) return null
+  const n = v.n === null || Number.isFinite(v.n) ? v.n : null
+  const requestedAt = Number.isFinite(v.requestedAt) ? v.requestedAt : 0
+  return { mode, n, requestedAt }
+}
+
+/**
+ * Sanitize a sweepLastResult value. Shape contract:
+ *   { applied: number, skippedProtected: number }
+ * Anything that fails the type check returns null.
+ */
+function normalizeSweepLastResult(v) {
+  if (!v || typeof v !== "object") return null
+  const applied = Number.isFinite(v.applied) ? v.applied : 0
+  const skippedProtected = Number.isFinite(v.skippedProtected) ? v.skippedProtected : 0
+  return { applied, skippedProtected }
 }
 
 function lightStatePath(dataDir, fp) {

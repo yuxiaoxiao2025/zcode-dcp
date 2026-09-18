@@ -7,13 +7,15 @@
 //   - main-session whitelist gate (3 states: main passes / sub-agent rejected /
 //     allowSubAgents=true inverts to blacklist)
 //   - file path extraction (ZCode tool params: file_path/path)
-//   - ZCode name mapping for DEFAULT_PROTECTED_TOOLS / COMPRESS_PROTECTED_TOOLS
+//   - ZCode name mapping for COMPRESS_PROTECTED_TOOLS
+//     (the historical DEFAULT_PROTECTED_TOOLS was removed in R2 — it was
+//     a dead constant with zero production consumers; the dedup-side
+//     "default" lives in prune.mjs as `SKIP_TOOLS`).
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
 import {
-    DEFAULT_PROTECTED_TOOLS,
     COMPRESS_PROTECTED_TOOLS,
     isToolNameProtected,
     globToRegExp,
@@ -22,26 +24,9 @@ import {
     isMainSession,
 } from "../proxy/protect.mjs"
 
-// ---------- DEFAULT_PROTECTED_TOOLS / COMPRESS_PROTECTED_TOOLS (ZCode 映射) ----------
+// ---------- COMPRESS_PROTECTED_TOOLS (ZCode 映射) ----------
 
-test("DEFAULT_PROTECTED_TOOLS contains ZCode tool name mapping", () => {
-    // ZCode tool names (PLAN: Agent/Task/Skill/TodoWrite/TodoRead/Write/Edit);
-    // opencode-only names (batch/plan_enter/plan_exit) removed; compress is matched dynamically.
-    assert.ok(Array.isArray(DEFAULT_PROTECTED_TOOLS))
-    assert.ok(DEFAULT_PROTECTED_TOOLS.includes("Agent"), "Agent (mapped from opencode 'task')")
-    assert.ok(DEFAULT_PROTECTED_TOOLS.includes("Task"), "Task (sub-agent invocation)")
-    assert.ok(DEFAULT_PROTECTED_TOOLS.includes("Skill"), "Skill")
-    assert.ok(DEFAULT_PROTECTED_TOOLS.includes("TodoWrite"), "TodoWrite (mapped from 'todowrite')")
-    assert.ok(DEFAULT_PROTECTED_TOOLS.includes("TodoRead"), "TodoRead (mapped from 'todoread')")
-    assert.ok(DEFAULT_PROTECTED_TOOLS.includes("Write"), "Write")
-    assert.ok(DEFAULT_PROTECTED_TOOLS.includes("Edit"), "Edit")
-    // opencode-only entries excluded
-    assert.ok(!DEFAULT_PROTECTED_TOOLS.includes("batch"))
-    assert.ok(!DEFAULT_PROTECTED_TOOLS.includes("plan_enter"))
-    assert.ok(!DEFAULT_PROTECTED_TOOLS.includes("plan_exit"))
-})
-
-test("COMPRESS_PROTECTED_TOOLS is a strict subset for the compress-strategy path", () => {
+test("COMPRESS_PROTECTED_TOOLS is the ZCode-mapped compress-strategy default", () => {
     assert.ok(Array.isArray(COMPRESS_PROTECTED_TOOLS))
     // PLAN: [Agent, Task, Skill, TodoWrite, TodoRead]
     assert.deepEqual(

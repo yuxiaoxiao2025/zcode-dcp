@@ -22,6 +22,7 @@ import path from "node:path"
 import { transformRequest } from "../proxy/pipeline.mjs"
 import { defaultLightState } from "../proxy/session.mjs"
 import { PRUNED_TOOL_OUTPUT } from "../proxy/prune.mjs"
+import { compressRunsDelta } from "../proxy/stats.mjs"
 
 // ---------------------------------------------------------------------------
 // Fixtures — synthetic Anthropic-protocol request bodies
@@ -1092,6 +1093,734 @@ describe("pipeline.transformRequest — integration", () => {
         `message at index ${i} (role=${m.role}) must carry ID tag (post-normalization)`,
       )
     }
+  })
+
+  // ============================
+  // ⑭ R3 metrics.maxRunId — compressRuns 增量计数输入
+  // ============================
+  // SPEC R3 / DESIGN D2: pipeline 每请求派生块时按调用分配顺序 runId
+  // （compress.mjs nextRunId——一次调用含多 range entry 只占一个 runId）。
+  // pipeline 把本次派生块的最大 runId 通过 metrics.maxRunId 导出，
+  // daemon 据此做增量计数。本组测试覆盖：
+  //   - 0 compress 历史 → metrics.maxRunId===0
+  //   - 1 compress 调用 → metrics.maxRunId===1
+  //   - 2 compress 调用（第 2 个 multi-range 2-entry）→ metrics.maxRunId===2
+  //     （multi-range 只占一个 runId，符合 K 次受理=K）
+  //   - compressError 请求 → metrics.maxRunId===0（errored 请求不前进 seen）
+  describe("⑭ R3 metrics.maxRunId — compressRuns 增量计数输入", () => {
+    it("14.① 无 compress 历史 → metrics.maxRunId===0", () => {
+      // 无 compress 调用的最小合法请求
+      const messages = [
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      ]
+      const body = makeBaseBody({ messages })
+      const ctx = {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      }
+
+      const result = transformRequest(body, ctx)
+
+      assert.equal(typeof result.metrics.maxRunId, "number", "maxRunId must be a number")
+      assert.equal(result.metrics.maxRunId, 0, "no compress history → maxRunId=0")
+    })
+
+    it("14.② 单次 compress 调用 → metrics.maxRunId===1", () => {
+      // makeIntegrationMessages() 自身包含 1 次 compress 调用（call_compress_1）
+      const body = makeBaseBody({ messages: makeIntegrationMessages() })
+      const ctx = {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      }
+
+      const result = transformRequest(body, ctx)
+
+      assert.equal(result.metrics.maxRunId, 1, "single compress call → maxRunId=1")
+    })
+
+    it("14.③ 2 次 compress 调用（第 2 次 multi-range 2-entry）→ metrics.maxRunId===2", () => {
+      // SPEC R3.2 判据① / DESIGN D2 核心要件：一次 compress 调用含 N 个
+      // range entry 在 runId 维度只占 1（与 blockId 的 entry 级颗粒相反）。
+      // 本 fixture 显式构造"2 次调用、第 2 次 2 entry"：第 1 次 call_compress_1
+      // 分配 runId=1；第 2 次 call_compress_multi 含两条非重叠 range entry
+      // （m0004..m0005 + m0006..m0007）共享 runId=2。两条 entry 都必须被
+      // 派生为独立 block（blockId 不同），但 maxRunId 必须仍是 2。
+      const messages = makeIntegrationMessages().slice()
+      messages.push({
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "call_compress_multi",
+          name: "mcp__dcp__compress",
+          input: {
+            topic: "two non-overlapping ranges",
+            content: [
+              // m0004..m0005 = call_2 的 Read 对（assistant tool_use + user tool_result）
+              { startId: "m0004", endId: "m0005", summary: "second Read pair" },
+              // m0006..m0007 = call_3 的 Read 对（third Read pair），与上一条
+              // 不重叠（m0005 < m0006 lex），通过 validateNonOverlapping。
+              { startId: "m0006", endId: "m0007", summary: "third Read pair" },
+            ],
+          },
+        }],
+      })
+      messages.push({
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "call_compress_multi",
+          content: "accepted",
+        }],
+      })
+
+      const result = transformRequest(makeBaseBody({ messages }), {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      })
+
+      // R3.2 ① K=2 次受理、K=2：multi-range 的两条 entry 在 runId 维度只
+      // 占一个槽位，maxRunId 必须仍 === 2（NOT 3）。
+      assert.equal(
+        result.metrics.maxRunId, 2,
+        `expected maxRunId=2 (2 compress calls; multi-range's 2 entries share runId=2 — NOT 3); got ${result.metrics.maxRunId}`,
+      )
+    })
+
+    it("14.④ compressError 请求 → metrics.maxRunId===0（异常不前进 seen）", () => {
+      // 让 deriveBlocks throw——bad range
+      const messages = [
+        { role: "user", content: [{ type: "text", text: "look at config" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "call_x1", name: "Read", input: { file_path: "src/config.ts" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "call_x1", content: "CFG_BODY" + "X".repeat(600) },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: "call_bad_compress",
+            name: "mcp__dcp__compress",
+            input: {
+              topic: "bad",
+              content: [{ startId: "m9999", endId: "m9998", summary: "unresolvable" }],
+            },
+          }],
+        },
+        {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: "call_bad_compress",
+            content: "accepted",
+          }],
+        },
+      ]
+      const body = makeBaseBody({ messages })
+      const ctx = {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      }
+
+      const result = transformRequest(body, ctx)
+
+      // compressError 必须在 metrics 上体现
+      assert.ok(result.metrics.compressError, "compressError must be set on bad range")
+      // compressError 时 maxRunId 必须=0——daemon 据此跳过 seen 推进
+      assert.equal(
+        result.metrics.maxRunId, 0,
+        `expected maxRunId=0 on compressError; got ${result.metrics.maxRunId}`,
+      )
+    })
+  })
+
+  // ============================
+  // ⑮ R3 compressRunsDelta — daemon 侧的纯函数
+  // ============================
+  // DESIGN D2 契约：
+  //   - (5, null, false) → 0 （首见基线，禁止追溯历史块）
+  //   - (8, 5, false) → 3 （正常前进）
+  //   - (3, 5, false) → 0 （单调钳制，负增量取 0）
+  //   - (9, 5, true)  → 0 （compressError 跳过，不前进也不计数）
+  describe("⑮ R3 compressRunsDelta — daemon 计数纯函数", () => {
+    it("15.① (5, null, false) → 0（首见基线）", () => {
+      assert.equal(compressRunsDelta(5, null, false), 0)
+    })
+
+    it("15.② (8, 5, false) → 3（正常前进）", () => {
+      assert.equal(compressRunsDelta(8, 5, false), 3)
+    })
+
+    it("15.③ (3, 5, false) → 0（单调钳制）", () => {
+      assert.equal(compressRunsDelta(3, 5, false), 0)
+    })
+
+    it("15.④ (9, 5, true) → 0（error 跳过）", () => {
+      assert.equal(compressRunsDelta(9, 5, true), 0)
+    })
+
+    it("15.⑤ 边界：maxRunId=0（无块）→ 0（无论 seen）", () => {
+      // 没有 compress 块不算 compressRuns
+      assert.equal(compressRunsDelta(0, null, false), 0)
+      assert.equal(compressRunsDelta(0, 5, false), 0)
+      assert.equal(compressRunsDelta(0, 0, false), 0)
+    })
+
+    it("15.⑥ 边界：(maxRunId==seen) → 0（重推不重复计）", () => {
+      // 重推同 maxRunId——daemon 重启后第一请求看到与之前一致的 maxRunId
+      assert.equal(compressRunsDelta(7, 7, false), 0)
+    })
+  })
+
+  // ============================
+  // ⑯ R3 daemon wiring — 重推不重复计（SPEC R3.1）
+  // ============================
+  // SPEC R3.1：同一调用跨请求确定性重推不重复计数。
+  // 这里用 pipeline+纯函数模拟 daemon 接线（daemon.mjs:407-435 实际接线同样路径）：
+  // 1) 第一次请求 maxRunId=2 → seen=null → delta=0（首见基线）+ 写 seen=2
+  // 2) 第二次请求同样 maxRunId=2 → seen=2 → delta=0（重推不重复）
+  // 3) 第三次请求 maxRunId=4 → seen=2 → delta=2（前进）
+  describe("⑯ R3 daemon wiring — 重推不重复计（集成语义）", () => {
+    it("16.① 首见基线 + 重推不重复计 + 后续前进（同一 fp 多次请求）", () => {
+      // 模拟 daemon 的 maxRunIdSeen 状态机
+      let seen = null
+      let compressRuns = 0
+      const log = []
+
+      // 1) 首次请求：maxRunId=2（2 次 compress 调用）
+      //    daemon 端：`hasCompressError = !!metrics.compressError === false`
+      let delta = compressRunsDelta(2, seen, false)
+      log.push({ phase: "first", delta })
+      assert.equal(delta, 0, "first-seen baseline: delta must be 0")
+      // 首见建立基线（seen 从 null → 2），但不计数
+      seen = 2
+      // compressRuns 保持 0（首见禁追溯）
+
+      // 2) 第二次请求（同历史 → 重推）maxRunId=2（同一组 compress 调用）
+      delta = compressRunsDelta(2, seen, false)
+      log.push({ phase: "replay", delta })
+      assert.equal(delta, 0, "replay must produce delta=0 (no double count)")
+      // seen 不前进（maxRunId <= seen）
+
+      // 3) 第三次请求：新 2 次 compress → maxRunId=4
+      //    这 2 次新调用各自含若干 range entry，但 runId 维度只占 K=2
+      //    个槽位（multi-range 一调用一 runId）——delta 必须 === 2。
+      delta = compressRunsDelta(4, seen, false)
+      log.push({ phase: "extend", delta })
+      assert.equal(delta, 2, "new compress calls extend counter by delta (K accepted = 2, each call's entry-count irrelevant to runId)")
+      compressRuns += delta
+      seen = 4
+
+      // 4) compressError 请求：maxRunId=0, seen=4
+      //    daemon 端会跳过 seen 更新 + 计数
+      delta = compressRunsDelta(0, seen, true)
+      log.push({ phase: "error", delta })
+      assert.equal(delta, 0, "compressError must produce delta=0")
+      // seen 不动（daemon 不会在 error 请求上 saveLightState 更新 maxRunIdSeen）
+
+      // 5) 校验 SPEC R3.2 判据②：预置含 N 个历史压缩块会话 → 首见 → 发 1 次非压缩请求 → 增量=0
+      //    "非压缩请求" = maxRunId=0（无 compress 块派生）
+      delta = compressRunsDelta(0, seen, false)
+      log.push({ phase: "nonCompress", delta })
+      assert.equal(delta, 0, "non-compress request on first-seen must produce delta=0")
+
+      // 总压缩次数：只有 extend 阶段贡献了 K=2（K 次受理=K，multi-range
+      // 内的 entry 数不累加 runId——这是 R3.2 ① / D2 撤销 blockId 选用
+      // runId 的根本依据）。
+      assert.equal(compressRuns, 2, "K accepted calls = 2 (per-call granularity, NOT per-entry)")
+    })
+
+    it("16.② pipeline.metrics.maxRunId 在 daemon 接线形态下可被读出（daemon 行为契约）", () => {
+      // 直接走 pipeline.transformRequest，验证 daemon 后续能从此字段读数。
+      // 用与 14.③ 同构的 fixture：2 次 compress 调用、第 2 次是真实
+      // 2-entry multi-range（覆盖 m0004..m0005 + m0006..m0007）。
+      const messages = makeIntegrationMessages().slice()
+      messages.push({
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "call_compress_multi",
+          name: "mcp__dcp__compress",
+          input: {
+            topic: "two non-overlapping ranges",
+            content: [
+              { startId: "m0004", endId: "m0005", summary: "second Read pair" },
+              { startId: "m0006", endId: "m0007", summary: "third Read pair" },
+            ],
+          },
+        }],
+      })
+      messages.push({
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "call_compress_multi",
+          content: "accepted",
+        }],
+      })
+      const result = transformRequest(makeBaseBody({ messages }), {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      })
+
+      // daemon 用这两个值：
+      //   - maxRunId  → 给 compressRunsDelta
+      //   - compressError → 决定 hasCompressError
+      assert.equal(result.metrics.maxRunId, 2)
+      assert.equal(result.metrics.compressError, undefined)
+
+      // 把这两个值喂给纯函数，模拟 daemon 的接线：
+      const seen = null // 首次
+      const delta = compressRunsDelta(
+        result.metrics.maxRunId,
+        seen,
+        !!result.metrics.compressError,
+      )
+      assert.equal(delta, 0, "first-seen baseline")
+    })
+  })
+
+  // ============================
+  // ⑰ R8.3 / DESIGN D3 — metrics.savedTokensByStrategy (per-strategy split)
+  // ============================
+  // SPEC R8.3: metrics.savedTokensByStrategy is the per-strategy breakdown
+  // of savedTokensEst, mirroring stats.byStrategyTokens but exposed per-request
+  // for the per-request jsonl record (D3a). Buckets: {dedup, purge, sweep, compress}.
+  //
+  // Contract:
+  //   - savedTokensByStrategy.compress === compressSavings (the value folded
+  //     into savedTokensEst on the compress side)
+  //   - savedTokensByStrategy.{dedup,purge,sweep} = the prune-plan's
+  //     byStrategyTokens breakdown
+  //   - sum of all 4 buckets === savedTokensEst
+  describe("⑰ R8.3 metrics.savedTokensByStrategy — per-strategy split", () => {
+    it("17.① compress + dedup + purge fixture → bucket split + sum invariant", () => {
+      // makeIntegrationMessages() includes 1 successful compress tool_use +
+      // 3 identical Reads → dedup picks tu_a/tu_b + 1 errored Bash with
+      // enough trailing user turns for purge. The 4-bucket split must
+      // exist on metrics and must sum exactly to savedTokensEst.
+      const body = makeBaseBody({ messages: makeIntegrationMessages() })
+      const ctx = {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      }
+      const result = transformRequest(body, ctx)
+
+      // Shape
+      assert.ok(
+        result.metrics.savedTokensByStrategy,
+        "savedTokensByStrategy must exist on metrics",
+      )
+      const bs = result.metrics.savedTokensByStrategy
+      assert.equal(typeof bs.dedup, "number", "dedup must be a number")
+      assert.equal(typeof bs.purge, "number", "purge must be a number")
+      assert.equal(typeof bs.sweep, "number", "sweep must be a number")
+      assert.equal(typeof bs.compress, "number", "compress must be a number")
+
+      // Dedup bucket > 0 (3 identical Reads → dedup picks tu_a/tu_b)
+      assert.ok(
+        bs.dedup > 0,
+        `dedup bucket must be > 0 after dedup fixture; got ${bs.dedup}`,
+      )
+      // Purge bucket > 0 (errored Bash with 4 trailing user turns)
+      assert.ok(
+        bs.purge > 0,
+        `purge bucket must be > 0 after purge fixture; got ${bs.purge}`,
+      )
+      // Sum invariant: all 4 buckets sum to savedTokensEst
+      const sum = bs.dedup + bs.purge + bs.sweep + bs.compress
+      assert.equal(
+        sum, result.metrics.savedTokensEst,
+        `sum of savedTokensByStrategy buckets must equal savedTokensEst (sum=${sum}, savedTokensEst=${result.metrics.savedTokensEst})`,
+      )
+    })
+
+    it("17.② sweep fixture (lightState.sweepToolCallIds non-empty) → sweep bucket > 0 (not hardcoded 0)", () => {
+      // Build a session with one Read call, then mark its tool_use id as
+      // swept via lightState.sweepToolCallIds. The pipeline must surface the
+      // sweep's contribution in metrics.savedTokensByStrategy.sweep (>0).
+      const messages = [
+        { role: "user", content: [{ type: "text", text: "read the auth module" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_sweep_target",
+              name: "Read",
+              input: { file_path: "src/auth.ts" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_sweep_target",
+              content: "AUTH_BODY".repeat(200),
+            },
+          ],
+        },
+        { role: "user", content: [{ type: "text", text: "next request" }] },
+      ]
+      const lightState = defaultLightState()
+      lightState.sweepToolCallIds = ["call_sweep_target"]
+
+      const result = transformRequest(makeBaseBody({ messages }), {
+        config: makeConfig(),
+        lightState,
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      })
+
+      // Sweep bucket must be > 0 (not hardcoded 0). The estimate is the
+      // tool_use + tool_result pair token estimate.
+      assert.ok(
+        result.metrics.savedTokensByStrategy,
+        "savedTokensByStrategy must exist",
+      )
+      assert.ok(
+        result.metrics.savedTokensByStrategy.sweep > 0,
+        `sweep bucket must be > 0 after sweep mark; got ${result.metrics.savedTokensByStrategy.sweep}`,
+      )
+
+      // Sum invariant still holds
+      const sum =
+        result.metrics.savedTokensByStrategy.dedup +
+        result.metrics.savedTokensByStrategy.purge +
+        result.metrics.savedTokensByStrategy.sweep +
+        result.metrics.savedTokensByStrategy.compress
+      assert.equal(
+        sum, result.metrics.savedTokensEst,
+        `sum invariant must hold with sweep bucket; sum=${sum}, savedTokensEst=${result.metrics.savedTokensEst}`,
+      )
+    })
+
+    it("17.③ no-hits fixture (no dedup / purge / sweep / compress) → all buckets=0, sum=savedTokensEst=0", () => {
+      const messages = [
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      ]
+      const result = transformRequest(makeBaseBody({ messages }), {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      })
+
+      assert.equal(result.metrics.savedTokensEst, 0)
+      assert.ok(result.metrics.savedTokensByStrategy)
+      assert.equal(result.metrics.savedTokensByStrategy.dedup, 0)
+      assert.equal(result.metrics.savedTokensByStrategy.purge, 0)
+      assert.equal(result.metrics.savedTokensByStrategy.sweep, 0)
+      assert.equal(result.metrics.savedTokensByStrategy.compress, 0)
+    })
+
+    it("17.④ gate-rejected fixture (non-main session) → all buckets=0", () => {
+      // Non-main session → pipeline returns immediately with savedTokensEst=0
+      // and all bucket counters at 0 (no transforms ran).
+      const messages = [
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      ]
+      const body = makeBaseBody({ messages, system: HELPER_SYSTEM })
+      const result = transformRequest(body, {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      })
+
+      assert.equal(result.metrics.savedTokensEst, 0)
+      assert.ok(result.metrics.savedTokensByStrategy)
+      assert.equal(result.metrics.savedTokensByStrategy.dedup, 0)
+      assert.equal(result.metrics.savedTokensByStrategy.purge, 0)
+      assert.equal(result.metrics.savedTokensByStrategy.sweep, 0)
+      assert.equal(result.metrics.savedTokensByStrategy.compress, 0)
+    })
+
+    it("17.⑤ compress bucket equals savedTokensEst when no prune strategy hits", () => {
+      // Fixture has a long message (m0001) + a compress tool_use that
+      // replaces it with a short summary. No duplicate Reads, no errored
+      // tools, no sweep marks → dedup/purge/sweep buckets must all be 0;
+      // the entire savedTokensEst comes from the compress side. The
+      // contract is that the 4 buckets sum exactly to savedTokensEst.
+      const longOriginal = "AAA_AUTH_MODULE_BODY_FIRST_READ" + "X".repeat(800)
+      const messages = [
+        { role: "user", content: [{ type: "text", text: longOriginal }] },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Got it." }],
+        },
+        { role: "user", content: [{ type: "text", text: "Now compress the auth read history." }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_compress_only",
+              name: "mcp__dcp__compress",
+              input: {
+                topic: "auth module intro",
+                content: [
+                  { startId: "m0001", endId: "m0001", summary: "User asked to inspect the auth module." },
+                ],
+              },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "call_compress_only", content: "accepted" },
+          ],
+        },
+        { role: "user", content: [{ type: "text", text: "do thing 1" }] },
+        { role: "user", content: [{ type: "text", text: "do thing 2" }] },
+        { role: "user", content: [{ type: "text", text: "do thing 3" }] },
+      ]
+      const result = transformRequest(makeBaseBody({ messages }), {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      })
+
+      // No prune strategy hits on this minimal fixture → dedup/purge/sweep = 0
+      assert.equal(result.metrics.savedTokensByStrategy.dedup, 0)
+      assert.equal(result.metrics.savedTokensByStrategy.purge, 0)
+      assert.equal(result.metrics.savedTokensByStrategy.sweep, 0)
+      // The compress bucket + 0 + 0 + 0 must equal savedTokensEst (sum
+      // invariant). The actual compress-bucket value depends on the
+      // pipeline's compressSavings estimator (a coarse proxy — see
+      // estimateCompressSavings in pipeline.mjs); this test pins only the
+      // exact-sum invariant, not the bucket's magnitude.
+      const sum =
+        result.metrics.savedTokensByStrategy.dedup +
+        result.metrics.savedTokensByStrategy.purge +
+        result.metrics.savedTokensByStrategy.sweep +
+        result.metrics.savedTokensByStrategy.compress
+      assert.equal(
+        sum, result.metrics.savedTokensEst,
+        `sum invariant must hold: ${sum} === ${result.metrics.savedTokensEst}`,
+      )
+    })
+  })
+
+  // ============================
+  // Gate 1.5 A1 — compress savings = covered-original minus synthetic tokens
+  // ============================
+  //
+  // SPEC R8.3 + H2: compress savings must reflect the REAL savings on
+  // the wire (covered messages that were replaced by the synthetic summary
+  // block). The pre-fix estimator summed (rawSummary.length −
+  // enhancedSummary.length)/4, which is roughly zero whenever the model
+  // writes a concise summary (the case for every well-behaved compress
+  // call). This test family pins the corrected semantics:
+  //   compressSavings = Σ estimateMessageTokens(covered originals)
+  //                   − Σ estimateMessageTokens(inserted synthetics)
+  // where covered = union of coveredIndices across ACTIVE blocks (nested
+  // consume deduplicates naturally — the inner block is dropped by the
+  // active set filter and its covered indices are subsumed by the outer
+  // block's range).
+  describe("Gate 1.5 A1 — compress savings = covered-original − synthetic", () => {
+    it("A1.① 800-char covered original → savedTokensByStrategy.compress > 0 (RED pre-fix)", () => {
+      // Old estimator returned 0 here because rawSummary and
+      // enhancedSummary are both short labels. The fix must surface the
+      // real ~200 tokens covered (800 chars / 4).
+      const longOriginal = "AAA_AUTH_MODULE_BODY_FIRST_READ" + "X".repeat(800)
+      const messages = [
+        { role: "user", content: [{ type: "text", text: longOriginal }] },
+        { role: "assistant", content: [{ type: "text", text: "Got it." }] },
+        { role: "user", content: [{ type: "text", text: "Now compress the auth read history." }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_compress_only",
+              name: "mcp__dcp__compress",
+              input: {
+                topic: "auth module intro",
+                content: [
+                  { startId: "m0001", endId: "m0001", summary: "User asked to inspect the auth module." },
+                ],
+              },
+            },
+          ],
+        },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_compress_only", content: "accepted" }] },
+        { role: "user", content: [{ type: "text", text: "do thing 1" }] },
+        { role: "user", content: [{ type: "text", text: "do thing 2" }] },
+        { role: "user", content: [{ type: "text", text: "do thing 3" }] },
+      ]
+      const result = transformRequest(makeBaseBody({ messages }), {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      })
+
+      // The compress bucket must reflect the 800-char covered original.
+      // Pre-fix: 0. Post-fix: ~200 (800/4) minus the short synthetic.
+      // We assert > 100 to leave headroom for the synthetic, while still
+      // pinning "the old estimator cannot reach this".
+      assert.ok(
+        result.metrics.savedTokensByStrategy.compress > 100,
+        `compress bucket must reflect the ~200-token covered original minus the short synthetic; got ${result.metrics.savedTokensByStrategy.compress}`,
+      )
+      // Sum invariant must still hold (compress split is consistent with the total).
+      const sum =
+        result.metrics.savedTokensByStrategy.dedup +
+        result.metrics.savedTokensByStrategy.purge +
+        result.metrics.savedTokensByStrategy.sweep +
+        result.metrics.savedTokensByStrategy.compress
+      assert.equal(
+        sum, result.metrics.savedTokensEst,
+        `sum invariant must hold post-fix: ${sum} === ${result.metrics.savedTokensEst}`,
+      )
+    })
+
+    it("A1.② no compress tool_use → compress bucket = 0 (unchanged behaviour)", () => {
+      // Sanity: when no compress tool_use was issued, compress bucket
+      // stays 0. Same fixture as 17.③ (no-hit control).
+      const messages = [
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      ]
+      const result = transformRequest(makeBaseBody({ messages }), {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      })
+
+      assert.equal(result.metrics.savedTokensByStrategy.compress, 0)
+      assert.equal(result.metrics.savedTokensEst, 0)
+    })
+
+    it("A1.③ nested consume (outer covers inner's anchor) → savings counted ONCE on outer union", () => {
+      // Outer block compresses m0001..m0010 (10 messages, 500 chars each).
+      // Inner block compresses m0003..m0005 (3 messages, subsumed by
+      // outer). Inner is dropped by the active filter (consumed); outer
+      // is the sole ACTIVE block.
+      //
+      // Pre-fix bug shape: the inner block ALSO contributed its own
+      // (rawSummary − enhancedSummary)/4 savings in addition to outer's,
+      // double-counting m0003..m0005. Post-fix: only the active-block
+      // union counts, so each covered message contributes exactly once.
+      const chars = "A".repeat(500)
+      const messages = [
+        { role: "user", content: [{ type: "text", text: chars }] }, // m0001
+        { role: "assistant", content: [{ type: "text", text: "got 1" }] }, // m0002
+        { role: "user", content: [{ type: "text", text: chars }] }, // m0003 inner anchor
+        { role: "assistant", content: [{ type: "text", text: "got 3" }] }, // m0004
+        { role: "user", content: [{ type: "text", text: chars }] }, // m0005
+        { role: "assistant", content: [{ type: "text", text: "got 5" }] }, // m0006
+        { role: "user", content: [{ type: "text", text: chars }] }, // m0007
+        { role: "assistant", content: [{ type: "text", text: "got 7" }] }, // m0008
+        { role: "user", content: [{ type: "text", text: chars }] }, // m0009
+        { role: "assistant", content: [{ type: "text", text: "got 9" }] }, // m0010
+        { role: "user", content: [{ type: "text", text: "Now compress two ranges" }] }, // m0011
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_inner",
+              name: "mcp__dcp__compress",
+              input: {
+                topic: "inner",
+                content: [{ startId: "m0003", endId: "m0005", summary: "Inner summary covers B-C." }],
+              },
+            },
+          ],
+        }, // m0012
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_inner", content: "ok" }] }, // m0013
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_outer",
+              name: "mcp__dcp__compress",
+              input: {
+                topic: "outer",
+                content: [{ startId: "m0001", endId: "m0010", summary: "Outer summary covers all." }],
+              },
+            },
+          ],
+        }, // m0014
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_outer", content: "ok" }] }, // m0015
+      ]
+      const result = transformRequest(makeBaseBody({ messages }), {
+        config: makeConfig(),
+        lightState: defaultLightState(),
+        usage: LOW_USAGE,
+        dataDir: tmpDir,
+        cwd: tmpDir,
+      })
+
+      // Outer is the sole active block (inner consumed).
+      assert.equal(result.metrics.activeBlocks, 1, "outer active, inner consumed")
+
+      // Covered-union originals: m0001..m0010 → 10 messages, ~5 user msgs
+      // of 500 chars (~125 tokens) + 5 assistant msgs of ~5 chars (~1
+      // token) → ~5*125 + 5*1 = ~630 tokens. Subtract the short
+      // synthetic (~25 tokens) → ~605. The lower bound 500 proves the
+      // inner's 3 covered messages are NOT double-counted AND the
+      // outer's 10 messages ARE counted (the old estimator would have
+      // returned 0 here). The upper bound 700 leaves headroom for the
+      // synthetic text length variation.
+      const c = result.metrics.savedTokensByStrategy.compress
+      assert.ok(
+        c > 500 && c < 700,
+        `compress bucket must reflect 10-message union (~605 tokens minus synthetic); got ${c}`,
+      )
+      // Sum invariant still holds.
+      const sum =
+        result.metrics.savedTokensByStrategy.dedup +
+        result.metrics.savedTokensByStrategy.purge +
+        result.metrics.savedTokensByStrategy.sweep +
+        result.metrics.savedTokensByStrategy.compress
+      assert.equal(
+        sum, result.metrics.savedTokensEst,
+        `sum invariant must hold for nested consume fixture: ${sum} === ${result.metrics.savedTokensEst}`,
+      )
+    })
   })
 })
 

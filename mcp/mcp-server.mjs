@@ -64,6 +64,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { pathToFileURL, fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
+import { getVersion } from "../proxy/version.mjs"
 
 // Dynamic imports of project modules (resolved relative to this file). The
 // import paths match the dependency contract specified in PLAN task-13:
@@ -89,9 +90,11 @@ const KEEPALIVE_MS = Number(process.env.DCP_TEST_KEEPALIVE_MS) || 15000
 // Server info + tool registry (built at startup)
 // ---------------------------------------------------------------------------
 
+// R9 / D10: version comes from the plugin manifest via getVersion() so
+// there's exactly one source of truth (the .zcode-plugin/plugin.json file).
 const SERVER_INFO = Object.freeze({
   name: "zcode-dcp",
-  version: "0.1.0",
+  version: getVersion(),
 })
 
 // ---------------------------------------------------------------------------
@@ -239,11 +242,24 @@ async function buildToolsList(env) {
   })
   tools.push({
     name: "dcp_sweep",
-    description: "Trigger a one-shot sweep: clears dedup anchors so the next pipeline pass re-derives all duplicate tool calls.",
+    // Gate 1.5 B2: real sweep via directive consumed on next request.
+    //
+    // DCP upstream applies sweep IMMEDIATELY in the handler because it has
+    // live access to the messages array via SessionState. The ZCode proxy
+    // is stateless across requests, so the MCP tool queues a directive
+    // via /dcp-admin/state/sweep and the daemon's pipeline consumes it on
+    // the next /v1/messages inbound request. This means the tool returns
+    // immediately with an acceptance message; the actual prune happens
+    // when the next model request flows through.
+    //
+    // `count` argument:
+    //   - omitted/null/0 → "since last user message" mode (DCP default)
+    //   - positive int N → "last N tool calls" mode
+    description: "Queue a one-shot sweep. No-arg sweeps all tool calls since the previous user message; `count: N` sweeps the most recent N tool calls. Effect is applied on this session's NEXT model request (delayed-apply semantics; DCP-faithful except for the immediate vs. deferred-application timing).",
     inputSchema: {
       type: "object",
       properties: {
-        count: { type: "number", description: "Optional. Reserved for future use; ignored in the current implementation." },
+        count: { type: "number", minimum: 1, description: "Optional positive integer. When set, sweep the most recent N tool calls; when omitted, sweep all tool calls since the previous user message." },
       },
     },
   })
@@ -260,11 +276,23 @@ async function buildToolsList(env) {
   })
   tools.push({
     name: "dcp_decompress",
-    description: "Decompress the most recently active session: clear the operator-excluded block list so the next request restores compressed sections.",
+    // Gate 1.5 B3: per-block decompress (lists available blocks / restores one).
+    //
+    // DCP v3.1.15 upstream (lib/commands/decompress.ts) behaviour:
+    //   * no-arg → list available blocks (displayId + tokens + topic)
+    //   * with N → restore block N (target.active=false → exclusion writer)
+    //
+    // ZCode adaptation (CAPABILITY-MAPPING v0.1.5 row 2): "restore" is
+    // implemented as adding the block id to the per-fp exclusion list
+    // (lightState.decompressBlockIds). The pipeline drops the synthetic
+    // summary for that block at deriveBlocks, and the original covered span
+    // survives verbatim in the next request. "Restore all" is the
+    // dcp_recompress tool (clears the list + flips manualMode off).
+    description: "List available compression blocks (no-arg) or restore a single block by id (blockId=<n>; adds to exclusion list so the original messages return on the next request).",
     inputSchema: {
       type: "object",
       properties: {
-        blockId: { type: "string", description: "Optional. Reserved for future use; current implementation clears all blocks." },
+        blockId: { type: "number", minimum: 1, description: "Optional positive integer. When set, restore that specific block (add to the exclusion list). When omitted, list the available blocks." },
       },
     },
   })
@@ -552,6 +580,17 @@ function compressAcceptanceText(rangeCount, messageCount) {
  * Format a stats snapshot from /dcp-admin/stats into a human-readable text
  * block. Mirrors the DCP `/dcp stats` command's shape (CAP-12). Faithful to
  * the proportional breakdown without copying any DCP-proprietary verbiage.
+ *
+ * R8.1 / R8.2 / R8.3 (DESIGN D7) wording:
+ *   - "Savings rate" replaces "Cache hit rate" — same saved/(sent+saved)
+ *     formula, but the label no longer implies an upstream prompt-cache
+ *     hit ratio.
+ *   - byStrategy rows are labelled "hits" (per-request cumulative count
+ *     of strategy occurrences), NOT a share-of-tokens breakdown.
+ *   - "Saved tokens by strategy" line is rendered only when the snapshot
+ *     carries stats.byStrategyTokens (R8.3 / D3). Legacy stats files
+ *     (pre-R8.3) lack this field; the line is omitted to remain
+ *     backward-compatible without inventing numbers.
  */
 function formatStatsText(json) {
   if (!json || typeof json !== "object") return "No stats available yet."
@@ -564,8 +603,9 @@ function formatStatsText(json) {
   const compress = Number(bs.compress) || 0
   const requests = Number(json.requests) || 0
   const compressRuns = Number(json.compressRuns) || 0
-  const totalSavings = dedup + purge + sweep + compress
-  const hitRate = sent > 0 ? ((saved / (sent + saved)) * 100).toFixed(1) + "%" : "n/a"
+  // R8.1: rename label; preserved saved/(sent+saved) ratio (not an upstream
+  // prompt-cache rate).
+  const savingsRate = sent > 0 ? ((saved / (sent + saved)) * 100).toFixed(1) + "%" : "n/a"
   const lines = []
   lines.push("DCP Stats — all-time aggregate")
   lines.push("-".repeat(40))
@@ -573,18 +613,31 @@ function formatStatsText(json) {
   lines.push(`Compress runs:      ${compressRuns}`)
   lines.push(`Sent tokens:        ${sent.toLocaleString("en-US")}`)
   lines.push(`Saved tokens:       ${saved.toLocaleString("en-US")}`)
-  lines.push(`Cache hit rate:     ${hitRate}`)
+  lines.push(`Savings rate:       ${savingsRate}`)
   lines.push("")
-  lines.push("Savings by strategy:")
+  // R8.2: byStrategy rows are labelled "hits" (per-request cumulative
+  // strategy occurrences). No token-share paragraph below.
+  lines.push("Savings by strategy (hits — per-request cumulative count):")
   lines.push(`  deduplication:    ${dedup.toLocaleString("en-US")}`)
   lines.push(`  purge-errors:     ${purge.toLocaleString("en-US")}`)
   lines.push(`  sweep:            ${sweep.toLocaleString("en-US")}`)
   lines.push(`  compress:         ${compress.toLocaleString("en-US")}`)
-  if (totalSavings > 0) {
-    const pct = (n) => ((n / totalSavings) * 100).toFixed(1) + "%"
+  // R8.3: per-strategy saved-token split. Only render when the field is
+  // present in the snapshot — legacy stats-all.json files (pre-R8.3)
+  // lack byStrategyTokens, and silently dropping the line keeps the
+  // remaining output accurate instead of inventing zeros.
+  if (json.byStrategyTokens && typeof json.byStrategyTokens === "object") {
+    const bst = json.byStrategyTokens
+    const d = Number(bst.dedup) || 0
+    const p = Number(bst.purge) || 0
+    const s = Number(bst.sweep) || 0
+    const c = Number(bst.compress) || 0
     lines.push("")
-    lines.push(`Strategy share (of ${totalSavings.toLocaleString("en-US")} saved tokens):`)
-    lines.push(`  dedup ${pct(dedup)}  purge ${pct(purge)}  sweep ${pct(sweep)}  compress ${pct(compress)}`)
+    lines.push("Saved tokens by strategy:")
+    lines.push(`  deduplication:    ${d.toLocaleString("en-US")}`)
+    lines.push(`  purge-errors:     ${p.toLocaleString("en-US")}`)
+    lines.push(`  sweep:            ${s.toLocaleString("en-US")}`)
+    lines.push(`  compress:         ${c.toLocaleString("en-US")}`)
   }
   if (Array.isArray(json.sessions) && json.sessions.length > 0) {
     lines.push("")
@@ -723,25 +776,123 @@ async function handleToolCall(name, args, ctx) {
   }
 
   // The remaining tools hit the /dcp-admin/state/<action> endpoint.
-  const actionMap = {
-    dcp_sweep: "sweep",
-    dcp_decompress: "decompress",
-    dcp_recompress: "recompress",
-  }
-  if (actionMap[name]) {
-    const action = actionMap[name]
-    const r = await adminGetWithRetry({ host, port, urlPath: "/dcp-admin/state/" + action, token, timeoutMs: 4000 })
+  // dcp_recompress keeps the legacy "clear all + manualMode off" semantics
+  // (unchanged from before). dcp_decompress is a custom handler (below) —
+  // it accepts blockId and renders the list path.
+  if (name === "dcp_recompress") {
+    const r = await adminGetWithRetry({ host, port, urlPath: "/dcp-admin/state/recompress", token, timeoutMs: 4000 })
     if (r.status === 0) {
-      return { ok: false, error: { code: -32000, message: "daemon unreachable; cannot apply " + action + " (host=" + host + " port=" + port + " token=" + (token ? token.slice(0,8)+"…" : "null") + ")" } }
+      return { ok: false, error: { code: -32000, message: "daemon unreachable; cannot apply recompress (host=" + host + " port=" + port + " token=" + (token ? token.slice(0,8)+"…" : "null") + ")" } }
     }
     if (r.status === 404) {
-      return { ok: true, result: { content: [{ type: "text", text: `No active session — ${action} applied to nothing.` }], isError: false } }
+      return { ok: true, result: { content: [{ type: "text", text: "No active session — recompress applied to nothing." }], isError: false } }
     }
     if (r.status !== 200) {
-      return { ok: false, error: { code: -32000, message: `admin /dcp-admin/state/${action} returned ${r.status}: ${r.text}` } }
+      return { ok: false, error: { code: -32000, message: `admin /dcp-admin/state/recompress returned ${r.status}: ${r.text}` } }
     }
     const detail = r.json && r.json.fp ? ` (fp=${String(r.json.fp).slice(0, 8)}…)` : ""
-    return { ok: true, result: { content: [{ type: "text", text: `${capitalize(action)} applied${detail}.` }], isError: false } }
+    return { ok: true, result: { content: [{ type: "text", text: `Recompress applied${detail}.` }], isError: false } }
+  }
+
+  // Gate 1.5 B2 — dcp_sweep has a custom handler because it accepts the
+  // `count` argument (forwarded to the admin endpoint as `?n=<int>`) and
+  // returns the honest "delayed-apply" semantics. The legacy contract was
+  // "applied to nothing because there's no anchor state" — replaced with a
+  // real sweep directive that the pipeline consumes on the next request.
+  if (name === "dcp_sweep") {
+    const countRaw = args && args.count
+    let urlPath = "/dcp-admin/state/sweep"
+    let modeLabel
+    if (countRaw !== undefined && countRaw !== null && countRaw !== "") {
+      // Defer numeric validation to the daemon (it returns 400 on bad input).
+      const n = Number(countRaw)
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+        return {
+          ok: false,
+          error: { code: -32602, message: "dcp_sweep: count must be a positive integer; got " + JSON.stringify(countRaw) },
+        }
+      }
+      urlPath = "/dcp-admin/state/sweep?n=" + n
+      modeLabel = `last ${n} tool call(s)`
+    } else {
+      modeLabel = "all tool calls since the previous user message"
+    }
+    const r = await adminGetWithRetry({ host, port, urlPath, token, timeoutMs: 4000 })
+    if (r.status === 0) {
+      return { ok: false, error: { code: -32000, message: "daemon unreachable; cannot queue sweep" } }
+    }
+    if (r.status === 404) {
+      return { ok: true, result: { content: [{ type: "text", text: "No active session — sweep applied to nothing." }], isError: false } }
+    }
+    if (r.status === 400) {
+      return { ok: false, error: { code: -32602, message: `sweep parameter invalid: ${r.text}` } }
+    }
+    if (r.status !== 200) {
+      return { ok: false, error: { code: -32000, message: `admin /dcp-admin/state/sweep returned ${r.status}: ${r.text}` } }
+    }
+    const detail = r.json && r.json.fp ? ` (fp=${String(r.json.fp).slice(0, 8)}…)` : ""
+    // Honest delay-apply wording: the directive is queued, the actual prune
+    // happens when the next /v1/messages request flows through.
+    let text = `Sweep accepted: ${modeLabel}. It will be applied on this session's next request.`
+    // Surface the last-applied result so the operator can see the prior
+    // sweep's outcome (one-shot: cleared after the next read; the daemon
+    // returns it on every state/sweep call while the directive is queued).
+    if (r.json && r.json.lightState && r.json.lightState.sweepLastResult) {
+      const last = r.json.lightState.sweepLastResult
+      text += ` Last sweep: applied ${last.applied} tool(s), ${last.skippedProtected} protected skipped.`
+    }
+    text += detail
+    return { ok: true, result: { content: [{ type: "text", text }], isError: false } }
+  }
+
+  if (name === "dcp_decompress") {
+    // Gate 1.5 B3 — list available blocks (no-arg) OR restore one (blockId=N).
+    //
+    // The daemon's /dcp-admin/state/decompress endpoint speaks plain text on
+    // both paths so the surface stays close to DCP upstream
+    // (lib/commands/decompress.ts:formatAvailableBlocksMessage) and the MCP
+    // layer just returns the body verbatim. The single-source-of-truth
+    // contract: the pipeline writes lightState.activeBlockSummaries on every
+    // request (B3), the daemon returns it inside the {lightState} envelope on
+    // the blockId path, and the no-arg path renders the same data directly
+    // from light-state. The MCP server reads the rendered body back and
+    // surfaces it as the tool's text content.
+    const blockIdRaw = args && args.blockId
+    let urlPath = "/dcp-admin/state/decompress"
+    if (blockIdRaw !== undefined && blockIdRaw !== null && blockIdRaw !== "") {
+      const n = Number(blockIdRaw)
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+        return {
+          ok: false,
+          error: {
+            code: -32602,
+            message: "dcp_decompress: blockId must be a positive integer; got " + JSON.stringify(blockIdRaw),
+          },
+        }
+      }
+      urlPath = "/dcp-admin/state/decompress?blockId=" + n
+    }
+    const r = await adminGetWithRetry({ host, port, urlPath, token, timeoutMs: 4000 })
+    if (r.status === 0) {
+      return { ok: false, error: { code: -32000, message: "daemon unreachable; cannot apply decompress (host=" + host + " port=" + port + " token=" + (token ? token.slice(0,8)+"…" : "null") + ")" } }
+    }
+    if (r.status === 404) {
+      return { ok: true, result: { content: [{ type: "text", text: "No active session — decompress applied to nothing." }], isError: false } }
+    }
+    if (r.status === 400) {
+      return { ok: false, error: { code: -32602, message: `decompress parameter invalid: ${r.text}` } }
+    }
+    if (r.status !== 200) {
+      return { ok: false, error: { code: -32000, message: `admin /dcp-admin/state/decompress returned ${r.status}: ${r.text}` } }
+    }
+    // The daemon already rendered the response body (text/plain). On the
+    // blockId path it's a confirmation message; on the list path it's the
+    // Usage hint + block rows. We surface whatever the daemon returned
+    // verbatim — the daemon is the single-writer for the exclusion list
+    // (B3 contract) so there's nothing for the MCP layer to compute here.
+    const detail = r.json && r.json.fp ? ` (fp=${String(r.json.fp).slice(0, 8)}…)` : ""
+    const text = (r.text || "").replace(/\r?\n$/, "") + (blockIdRaw !== undefined && blockIdRaw !== "" ? detail : "")
+    return { ok: true, result: { content: [{ type: "text", text }], isError: false } }
   }
 
   if (name === "dcp_manual") {

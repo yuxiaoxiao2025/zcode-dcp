@@ -7,8 +7,6 @@
 通过本地代理（默认 `127.0.0.1:8367`）裁剪发给模型的请求里过时的工具
 输出，给长会话省 token。会话记录与 UI 历史永不修改。
 
-[![test](https://github.com/yuxiaoxiao2025/zcode-dcp/actions/workflows/test.yml/badge.svg)](https://github.com/yuxiaoxiao2025/zcode-dcp/actions/workflows/test.yml)
-
 ---
 
 ## 这是什么
@@ -49,71 +47,44 @@ HTTP 守护进程。代理在转发请求**前**，只对请求体的 `messages`
 - **Nudge injection（引导注入）** —— 上下文接近配置阈值时，代理
   注入一条引导消息，提示模型去压缩。
 
-受保护的工具（`TodoWrite`、`Agent`、`Skill`、`Write`、`Edit`……）
-永不参与裁剪。
+硬编码跳过名单：`Write` / `Edit` / `AskUserQuestion`（含 opencode
+小写名形，基名不区分大小写）的输出永不被去重占位符替换。其余工具
+——包括 `TodoWrite`、`Agent`、`Skill`——默认**可**被去重（与 DCP
+原版一致，其去重保护默认亦为空）；需要保护时把工具名加进
+`strategies.*.protectedTools`。
 
 ---
 
 ## 安装
 
-仓库根目录即插件本体（市场清单位于 `.claude-plugin/marketplace.json`，
-插件源为仓库根）。两种安装方式：
+本仓库里插件位于 `zcode-dcp/`，本地市场清单位于
+`local-marketplace/marketplace.json`。从本地市场安装：
 
-### 方式一：git 市场（推荐，无需克隆）
-
-1. **添加市场。** 设置 → 插件 → 添加插件市场 → 选 **Git 仓库** → 填
-   `https://github.com/yuxiaoxiao2025/zcode-dcp`。
-2. **安装并启用** `zcode-dcp`。
-
-### 方式二：本地目录（离线机器 / 自己改了代码）
-
-1. **克隆本仓库**到任意目录（或下载 zip 解压）。
-2. 新建一个 `marketplace.json`（放在任意独立文件夹里），把
-   `<克隆的绝对路径>` 替换成实际值：
-
-   ```json
-   {
-     "name": "zcode-dcp-local",
-     "plugins": [
-       {
-         "name": "zcode-dcp",
-         "source": { "source": "directory", "path": "<克隆的绝对路径>" },
-         "description": "Dynamic Context Pruning for ZCode (local copy)",
-         "version": "0.1.4"
-       }
-     ]
-   }
-   ```
-
-   > 市场清单的 `path` **必须是绝对路径**——ZCode 客户端不支持相对
-   > 路径遍历。
-3. 设置 → 插件 → 添加插件市场 → 选 **本地目录** → 选中该文件夹 →
-   安装并启用 `zcode-dcp`。
-
-### 装完之后（两种方式通用）
-
-1. **重启 ZCode 或新建一个会话。** 插件的 hooks 与 MCP 随会话快照
+1. **添加本地市场。** 设置 → 插件 → 创建 → 添加插件市场 → 选
+   **本地目录** → 选中仓库里的 `local-marketplace/` 文件夹。安装
+   并启用 `zcode-dcp`。
+2. **重启 ZCode 或新建一个会话。** 插件的 hooks 与 MCP 随会话快照
    生效。
-2. **确认代理已拉起。** 新开会话后执行 `/dcp-stats`，应返回统计。
+3. **确认代理已拉起。** 新开会话后执行 `/dcp-stats`，应返回统计。
    （若报 `daemon unreachable`，重启 ZCode，或在 shell 里跑
    `node <插件根>/hooks/session-start.mjs`。）
-3. **读取访问令牌。** 插件数据目录位于
+4. **读取访问令牌。** 插件数据目录位于
    `~/.zcode/cli/plugins/data/` 下 `zcode-dcp` 相关的子目录中，
    `cat` 里面的 `admin-token` 文件即可。
-4. **添加供应商必须走 UI。** 手写 `~/.zcode/v2/config.json` 或
+5. **添加供应商必须走 UI。** 手写 `~/.zcode/v2/config.json` 或
    `cli/config.json` **不生效**——UI 只认自己的注册表，
    `config.json` 只是单向导出桥。
    - 设置 → 模型设置 → 添加供应商
    - 名称：随便取（如 `DCP Proxy`）
    - 协议：**Anthropic**
    - 接口地址：`http://127.0.0.1:8367`
-   - API Key：粘贴第 3 步读到的 `admin-token` 内容（**不可留空**）
+   - API Key：粘贴第 4 步读到的 `admin-token` 内容（**不可留空**）
    - 模型 ID：`GLM-5.3`（或你上游支持的型号名）
    - 启用该供应商
-5. **模型选择器**切到该供应商对应的模型。
-6. **验证。** 跑一段含重复文件读取的任务，再 `/dcp-stats` 看节省量。
+6. **模型选择器**切到该供应商对应的模型。
+7. **验证。** 跑一段含重复文件读取的任务，再 `/dcp-stats` 看节省量。
 
-> 第 4 步在 UI 里加的供应商指向本地代理（`http://127.0.0.1:8367`）；
+> 第 5 步在 UI 里加的供应商指向本地代理（`http://127.0.0.1:8367`）；
 > 代理本身的 `upstream.baseUrl` / `upstream.apiKey`（在下面
 > `dcp.jsonc` 里配）指向真实模型端点。这是两件事。
 
@@ -130,7 +101,7 @@ HTTP 守护进程。代理在转发请求**前**，只对请求体的 `messages`
 
 ```jsonc
 {
-  "$schema": "./dcp.schema.json",
+  "$schema": "./zcode-dcp/dcp.schema.json",
   "upstream": {
     "baseUrl": "https://open.bigmodel.cn/api/anthropic",
     "apiKey": "你的真实供应商 key"
@@ -162,8 +133,8 @@ HTTP 守护进程。代理在转发请求**前**，只对请求体的 `messages`
   使用上游自身宣告的窗口。
 
 其余段（`strategies`、`compress`、`manualMode`、
-`protectedFilePatterns`……）从上游 DCP 沿袭，详见仓库根的
-`dcp.schema.json`。
+`protectedFilePatterns`……）从上游 DCP 沿袭，详见
+`zcode-dcp/dcp.schema.json`。
 
 ---
 
@@ -174,12 +145,12 @@ HTTP 守护进程。代理在转发请求**前**，只对请求体的 `messages`
 | 命令                    | 作用                                                                          |
 |-------------------------|-------------------------------------------------------------------------------|
 | `/dcp-compress [focus]` | 手动触发一次压缩（可指定关注点）。                                            |
-| `/dcp-stats`            | 真实发送/节省 token、各策略命中、缓存命中率。                                 |
+| `/dcp-stats`            | 真实发送/节省 token、各策略命中次数、节省率（saved/(sent+saved)）。            |
 | `/dcp-context`          | 上下文构成估算。                                                              |
-| `/dcp-sweep [N]`        | 立即剪除工具输出（全部或最后 N 个）。                                         |
+| `/dcp-sweep [N]`        | 裁剪最近 N 条工具调用（无参则裁上一条 user 消息之后的全部）。延迟应用：实际裁剪在该会话下一请求生效（vs. DCP 原版的即时裁剪；详见 docs/current/CAPABILITY-MAPPING.md）。 |
 | `/dcp-manual on\|off`   | 自动策略的手动模式开关。                                                      |
-| `/dcp-decompress [n]`   | 解压压缩块（无参列出）。                                                      |
-| `/dcp-recompress [n]`   | 重应用解压过的块。                                                            |
+| `/dcp-decompress [n]`   | 无参列出可用压缩块（`b<N> (~T tokens) - topic`）；`n` 恢复第 N 块（加入排除表，下一请求原文恢复）。 |
+| `/dcp-recompress [n]`   | 重新应用全部压缩（清排除表并关闭手动模式）。                                  |
 | `/dcp-setup`            | 打印安装/供应商配置指引。                                                     |
 
 ### 模型自主工具
@@ -208,8 +179,10 @@ HTTP 守护进程。代理在转发请求**前**，只对请求体的 `messages`
 
 代理保留三种独立信号：
 
-1. **真实用量 / 缓存命中率。** 来自上游响应 `usage`，代理逐字节
-   透传。**照常更新，反映裁剪后的真实消耗。**
+1. **真实用量 / 上游 prompt-cache 数据。** 来自上游响应 `usage`，代理逐字节
+   透传。**照常更新，反映裁剪后的真实消耗。**（这是上游缓存数字——
+   与 `/dcp-stats` 显示的*节省率*是两回事，后者是本地
+   saved/(sent+saved) 比率。）
 2. **上下文容量主数字 + 分项占比（MCP 工具 / 系统工具 / 消息 /
    技能 / 系统提示词）。** ZCode 按即将发出的请求在本地估算。
    **照常显示，但代表「裁剪前组装量」——真实发送更小。**
@@ -218,6 +191,11 @@ HTTP 守护进程。代理在转发请求**前**，只对请求体的 `messages`
 
 要看**真实发送量 vs 节省量**（含各策略命中明细），随时跑
 `/dcp-stats`。
+
+**三口径分项（v0.1.5+）：** 代理 `sentTokens`（及每请求 jsonl `sent` 字段）
+现统一计入 **system + tools + messages** 三大块——即真实计费面。MCP 工具
+报告的也是这个合计。ZCode 自家 IDE 出请求前的本地面板仍用其老估算器，
+可能不含 tools 定义；若两边不一致，**以代理数字为准**。
 
 ---
 
@@ -235,14 +213,20 @@ HTTP 守护进程。代理在转发请求**前**，只对请求体的 `messages`
    `/dcp-manual` `/dcp-decompress` `/dcp-recompress` 可能命中另一
    窗口的 session id。**自动裁剪（去重 / 清错 / nudge）按历史推导
    不受影响。**
-4. **`sentTokens` 估算不含 tools 定义。** ZCode 本地上下文计数器不
-   算工具定义本身的字节。要看「实际计费 token」以**上游 `usage`**
-   为准。
+4. **`sentTokens` 估算自 v0.1.5 起已含 tools 定义。** 守护进程本地的
+   `sentTokens` 现把工具定义按 `tool_use` 块的同源估算器（全块序列
+   化）计入——显示的「发送量」对应系统提示 + 工具定义 + 消息三大块
+   的合计，是真实计费面。ZCode IDE 自家出请求前的本地面板仍用老
+   估算器、可能不含 tools 定义；两边不一致时**以代理数字为准**。
+   要看「实际计费 token」以**上游 `usage`** 为准。
 5. **`EADDRINUSE` 端口被外家占用。** 在 `dcp.jsonc` 改 `proxy.port`，
    并把第 5 步加的供应商 URL 一起改。
 6. **裁剪会让 prompt cache 命中率短暂下降。** 因消息前缀变了，缓存
    复用率暂时下降。实测（DCP 原版）：裁剪后 ~85% vs 直连 ~90%。
    长会话总收益为正。
+7. **Windows CRLF 检出会挂 2 个命令文件测试。** `core.autocrlf=true`
+   时两个命令 frontmatter 用例因行尾 `\r` 失败；跑测试套件请用 LF
+   检出（`git -c core.autocrlf=false archive …`）或配置 LF 处理。
 
 ---
 
@@ -259,20 +243,10 @@ HTTP 守护进程。代理在转发请求**前**，只对请求体的 `messages`
 
 ---
 
-## 开发与测试
-
-零依赖——`node --test test/*.test.mjs` 即可跑全套测试（要求 Node 22+，
-依赖带位置信息的 V8 JSON 错误消息，已在 Node 22/24 验证）。
-注意：`test/mcp.test.mjs` 的集成测试在守护进程清理处使用了 Windows
-专用助手（`cmd.exe` / `taskkill`），完整测试套件目前要求在 Windows 上
-运行（CI 跑在 `windows-latest`）。插件运行时代码本身是纯跨平台 Node。
-
----
-
 ## 许可
 
 `AGPL-3.0-or-later`，衍生自 `@tarquinen/opencode-dcp` v3.1.15。逐
 模块来源标注与完整能力对照（已移植 16 / 降级 9 / 部分 1 / 不可行 3
-/ 不适用 3）见 [`docs/CAPABILITY-MAPPING.md`](./docs/CAPABILITY-MAPPING.md)。
+/ 不适用 3）交付后见 `docs/current/CAPABILITY-MAPPING.md`。
 
 详见 [`LICENSE`](./LICENSE) 与 [`NOTICE`](./NOTICE)。

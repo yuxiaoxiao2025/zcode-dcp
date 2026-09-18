@@ -7,9 +7,10 @@
 // DCP daemon is up so the user's first /v1/messages call can be served.
 // The actual long-running daemon supervisor lives in mcp/mcp-server.mjs; this
 // hook is the early-boot "kick the daemon into existence" — it spawns the
-// daemon via the SHARED launcher (mcp/daemon-launcher.mjs) and exits 0 once
-// the daemon's /dcp-admin/health endpoint responds 200 (or once 5s of
-// polling elapses, whichever is first).
+// daemon via the SHARED launcher (mcp/daemon-launcher.mjs) and bounded-waits
+// (R10/D6) up to COLD_START_WAIT_MS for /dcp-admin/health to respond 200.
+// If health flips healthy mid-wait, emit the DCP briefing via
+// hookSpecificOutput.additionalContext; on timeout emit `{}`.
 //
 // C-1 fix (task-13 review): the v1 port spawned `node proxy/daemon.mjs`
 // directly. `daemon.mjs` only exports `startDaemon` and has no top-level
@@ -30,7 +31,9 @@
 // hooks file is that "进程启动 node 一次即退，不常驻" — one-shot startup,
 // not a long-running supervisor.
 //
-// Output: empty JSON to stdout (ZCode's hook contract; no additionalContext).
+// Output: hookSpecificOutput.additionalContext JSON to stdout when healthy
+// (already-healthy branch or cold-start mid-wait flip — R10); empty `{}` on
+// cold-start timeout. ZCode's SessionStart contract — empty `{}` is a no-op.
 
 import { spawn } from "node:child_process"
 import fs from "node:fs"
@@ -44,7 +47,12 @@ const PLUGIN_ROOT = process.env.DCP_PLUGIN_ROOT || path.resolve(__dirname, "..")
 const PLUGIN_DATA = process.env.DCP_PLUGIN_DATA || path.join(PLUGIN_ROOT, "data")
 const DAEMON_LAUNCHER_JS = path.join(PLUGIN_ROOT, "mcp", "daemon-launcher.mjs")
 const DEFAULT_PORT = 8367
-const DEFAULT_PROBE_MS = 5000
+// R10/D6: cold-start bounded-wait for clipboard. Hook is a synchronous
+// contract (stdout + exit), so waiting is allowed but must be bounded.
+// Wait up to 3s for the daemon to come up; probe every 250ms; if health
+// flips to 200 mid-wait, emit the briefing; otherwise emit `{}`.
+const COLD_START_WAIT_MS = 3000
+const COLD_START_PROBE_INTERVAL_MS = 250
 
 function probe(host, port, timeoutMs) {
   return new Promise((resolve) => {
@@ -158,14 +166,28 @@ async function main() {
   })
   try { child.unref() } catch { /* ignore */ }
 
-  // Poll for up to 5s for the daemon to come up.
-  const deadline = Date.now() + DEFAULT_PROBE_MS
+  // R10/D6: bounded-wait for the daemon. If health flips to 200 during the
+  // 3s window, emit the briefing (same shape as the already-healthy branch).
+  // Otherwise emit `{}` per ZCode hook contract. v0.1.4 was: unconditional
+  // `{}` after the loop — health probe result was ignored.
+  //
+  // Tightness (R10 review Minor-2): re-check deadline + cap probe timeout to
+  // the remaining budget before each probe, so the worst-case tail can't
+  // overshoot the cap by a full probe-timeout (was: up to ~3.5s; now: ~3s).
+  const deadline = Date.now() + COLD_START_WAIT_MS
   while (Date.now() < deadline) {
-    if (await probe("127.0.0.1", port, 500)) break
-    await new Promise((r) => setTimeout(r, 200))
+    const remaining = deadline - Date.now()
+    const probeTimeout = Math.min(500, remaining)
+    if (probeTimeout <= 0) break
+    if (await probe("127.0.0.1", port, probeTimeout)) {
+      emit(briefing)
+      return
+    }
+    if (Date.now() >= deadline) break
+    await new Promise((r) => setTimeout(r, COLD_START_PROBE_INTERVAL_MS))
   }
 
-  // Per ZCode hook contract: emit empty JSON to stdout.
+  // Timeout — per ZCode hook contract: emit empty JSON to stdout.
   process.stdout.write("{}")
 }
 

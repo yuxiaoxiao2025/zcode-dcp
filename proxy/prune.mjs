@@ -40,6 +40,31 @@ export const PRUNED_TOOL_OUTPUT =
 export const PRUNED_TOOL_ERROR_INPUT = "[input removed due to failed tool call]"
 export const PRUNED_QUESTION_INPUT = "[questions removed - see output for user's answers]"
 
+// ---------- Shared dedup skip-list (R2.1 / SPEC R2) ----------
+//
+// DCP upstream (lib/messages/prune.ts:90) only has the bare lowercase names
+// 'edit', 'write', 'question'. ZCode emits the same tools in PascalCase
+// ('Write', 'Edit', 'Question') and the question tool in BOTH 'question'
+// (DCP) and 'AskUserQuestions' / 'AskUserQuestion' (ZCode MCP wiring, in
+// both singular and plural forms observed in real traffic). To keep the
+// output-substitution skip-list (:377) and the question input-substitution
+// skip-list (:456) in lock-step, both sites use this shared set: the bare
+// name after stripping the optional `mcp__<server>__` prefix is
+// lowercased and looked up here. Names not in the set fall through to the
+// placeholder substitution paths as normal.
+export const SKIP_TOOLS = new Set([
+    "edit",
+    "write",
+    "question",
+    "askuserquestion",
+    "askuserquestions",
+])
+
+function isSkipTool(name) {
+    if (typeof name !== "string") return false
+    return SKIP_TOOLS.has(stripMcpPrefix(name).toLowerCase())
+}
+
 // ---------- Signature (port of DCP deduplication.ts:96-127) ----------
 
 /**
@@ -300,6 +325,7 @@ export function planPrune(messages, config) {
         return {
             pruneToolCallIds: new Set(),
             byStrategy: { dedup: [], purgeErrors: [] },
+            byStrategyTokens: { dedup: 0, purge: 0 },
             savedTokensEst: 0,
         }
     }
@@ -307,6 +333,12 @@ export function planPrune(messages, config) {
     const out = {
         pruneToolCallIds: new Set(),
         byStrategy: { dedup: [], purgeErrors: [] },
+        // R8.3 / DESIGN D3: per-strategy token attribution. The dedup/purge
+        // buckets are populated below; sweep is left for the pipeline layer
+        // (the user's /dcp-admin sweep marks are merged into the prune set
+        // there and contribute to savedTokensEst separately). The three
+        // buckets sum to savedTokensEst so callers can read the split.
+        byStrategyTokens: { dedup: 0, purge: 0 },
         savedTokensEst: 0,
     }
 
@@ -316,27 +348,50 @@ export function planPrune(messages, config) {
     // Estimate saved tokens for every tool_use/tool_result block we are
     // about to placeholder-substitute. We use estimateMessageTokens over
     // each affected message; summing the slice we are removing gives a
-    // conservative upper bound for "saved".
+    // conservative upper bound for "saved". The estimate is split into
+    // byStrategyTokens.{dedup,purge} buckets keyed by the id's strategy
+    // ownership so the per-strategy split reported in metrics mirrors
+    // savedTokensEst exactly.
+    //
+    // ATTRIBUTION RULE (D3 review I-1): when an id lands in BOTH buckets
+    // (real case: identical repeated Bash commands that all fail → dedup
+    // picks the older twin AND purgeErrors picks it because is_error=true
+    // + turn threshold met), its token estimate must be counted in EXACTLY
+    // ONE bucket. We pick dedup-first — the more recent call is what's
+    // most "obsolete" once its older twin is collapsed, so the savings
+    // attribution follows the dedup path. The id's HIT COUNT in byStrategy
+    // (the id arrays) remains as-is: that counter is independent of token
+    // attribution (an id can be both a "dedup hit" and a "purge hit"
+    // without double-counting tokens).
     for (const id of out.pruneToolCallIds) {
+        // Determine bucket ownership — single attribution per id.
+        const inDedup = out.byStrategy.dedup.indexOf(id) !== -1
+        const inPurge = out.byStrategy.purgeErrors.indexOf(id) !== -1
+        const owner = inDedup ? "dedup" : (inPurge ? "purge" : null)
+        let idEstimate = 0
         for (let i = 0; i < safeMessages.length; i++) {
             const m = safeMessages[i]
             if (!m || !Array.isArray(m.content)) continue
             for (const p of m.content) {
                 if (!p || typeof p !== "object") continue
+                let blockEstimate = 0
                 if (p.type === "tool_use" && p.id === id) {
-                    out.savedTokensEst += estimateMessageTokens({
-                        content: [p],
-                    })
+                    blockEstimate = estimateMessageTokens({ content: [p] })
                 } else if (
                     p.type === "tool_result" &&
                     p.tool_use_id === id
                 ) {
-                    out.savedTokensEst += estimateMessageTokens({
-                        content: [p],
-                    })
+                    blockEstimate = estimateMessageTokens({ content: [p] })
+                }
+                if (blockEstimate > 0) {
+                    idEstimate += blockEstimate
+                    // Single attribution: dedup wins on overlap.
+                    if (owner === "dedup") out.byStrategyTokens.dedup += blockEstimate
+                    else if (owner === "purge") out.byStrategyTokens.purge += blockEstimate
                 }
             }
         }
+        out.savedTokensEst += idEstimate
     }
 
     return out
@@ -368,14 +423,14 @@ function applyToolOutputSubstitution(messages, plan, coveredIndices) {
             // `pruneToolOutputs` (only their inputs are cleared by
             // `pruneToolErrors`). The error MESSAGE is preserved.
             if (block.is_error === true) continue
-            // DCP prune.ts:90-92: skip question/edit/write.
+            // DCP prune.ts:90-92: skip question/edit/write. The shared
+            // SKIP_TOOLS set is the superset that adds the ZCode PascalCase
+            // forms (Write/Edit/Question) and the singular/plural AskUser*
+            // question-tool names, and matches case-insensitively on the
+            // bare name (with optional `mcp__<server>__` prefix stripped).
+            // See R2.1 / SKIP_TOOLS export above for the full set.
             const callName = findToolNameById(messages, block.tool_use_id)
-            if (
-                callName === "edit" ||
-                callName === "write" ||
-                callName === "question" ||
-                callName === "AskUserQuestions"
-            ) {
+            if (isSkipTool(callName)) {
                 continue
             }
             // Only string content is substituted — array content blocks are
@@ -438,10 +493,14 @@ function applyToolErrorInputSubstitution(messages, plan, coveredIndices) {
 }
 
 /**
- * Replace `input.questions` of the AskUserQuestions (or "question") tool
- * with PRUNED_QUESTION_INPUT when the id is in the dedup bucket
- * (DCP pruneToolInputs prunes questions across the same set of marked ids).
- * Mirrors DCP `pruneToolInputs` (prune.ts:99-126).
+ * Replace `input.questions` of the AskUserQuestions / AskUserQuestion /
+ * "question" tool with PRUNED_QUESTION_INPUT when the id is in the dedup
+ * bucket (DCP pruneToolInputs prunes questions across the same set of
+ * marked ids). Mirrors DCP `pruneToolInputs` (prune.ts:99-126).
+ *
+ * The skip-list is the shared SKIP_TOOLS set (R2.1) — same membership test
+ * as the output-substitution site, so the two sites cannot drift apart on
+ * which names are considered "the question tool".
  */
 function applyQuestionInputSubstitution(messages, plan, coveredIndices) {
     if (plan.pruneToolCallIds.size === 0) return
@@ -452,8 +511,7 @@ function applyQuestionInputSubstitution(messages, plan, coveredIndices) {
         for (const block of m.content) {
             if (!block || block.type !== "tool_use") continue
             if (!plan.pruneToolCallIds.has(block.id)) continue
-            const bare = stripMcpPrefix(block.name)
-            if (bare !== "AskUserQuestions" && bare !== "question") continue
+            if (!isSkipTool(block.name)) continue
             if (block.input && typeof block.input === "object") {
                 if ("questions" in block.input) {
                     block.input.questions = PRUNED_QUESTION_INPUT
@@ -486,6 +544,7 @@ export function applyPrune(messages, plan, coveredIndices) {
     const safePlan = plan || {
         pruneToolCallIds: new Set(),
         byStrategy: { dedup: [], purgeErrors: [] },
+        byStrategyTokens: { dedup: 0, purge: 0 },
         savedTokensEst: 0,
     }
 

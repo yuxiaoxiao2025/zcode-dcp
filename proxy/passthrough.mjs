@@ -194,18 +194,55 @@ const RESPONSE_HOP_BY_HOP = new Set([
 ])
 
 /**
- * Build the headers object to write on `clientRes` from an upstream response
- * headers object. Strips hop-by-hop headers; leaves everything else (status
- * code preserved separately).
+ * Build a forwardable header list from upstream response `rawHeaders`
+ * (Array<string> — alternating name, value, name, value, ...). Strips
+ * hop-by-hop headers (compared by lowercased name). Groups multi-value
+ * headers (same lowercased name appearing more than once — e.g. multiple
+ * Set-Cookie headers from the upstream) into a SINGLE entry whose value
+ * is an array; the caller passes that array to one `setHeader()` call so
+ * Node emits every value on the wire (rather than dropping all but the
+ * last, which is what naive `setHeader` repeats do). Preserves the case
+ * of the FIRST occurrence of each name (HTTP/1.1 header names are case-
+ * insensitive per RFC 7230 §3.2 — so the upstream's case choice is
+ * preserved verbatim downstream, restoring byte-faithful H1 fidelity).
+ *
+ * Returns `Array<[rawName: string, valueOrArray: string | string[]]>` in
+ * the order the upstream sent them (stable across multiple rawHeaders
+ * with the same lowercased name — we keep FIRST-occurrence case and emit
+ * ALL values in source order).
+ *
+ * @param {string[]|undefined} rawHeaders  upstreamRes.rawHeaders
+ * @returns {Array<[string, string|string[]]>}
  */
-function pickForwardableHeaders(upstreamHeaders) {
-  const out = {}
-  if (!upstreamHeaders || typeof upstreamHeaders !== "object") return out
-  for (const [k, v] of Object.entries(upstreamHeaders)) {
-    if (k == null) continue
-    const lower = String(k).toLowerCase()
+function pickForwardableHeadersFromRawHeaders(rawHeaders) {
+  if (!Array.isArray(rawHeaders) || rawHeaders.length === 0) return []
+  // Walk the name/value alternating array. Group by lowercased name so
+  // multi-value headers collapse to a single entry. The first occurrence's
+  // original case is what we emit downstream.
+  const groupOrder = []               // ordered list of lowercased keys (first-seen wins case)
+  const groupMap = new Map()          // lowercasedName -> { rawName, values: [] }
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    const rawName = rawHeaders[i]
+    const value = rawHeaders[i + 1]
+    if (rawName == null || value == null) continue
+    const lower = String(rawName).toLowerCase()
     if (RESPONSE_HOP_BY_HOP.has(lower)) continue
-    out[lower] = v
+    let entry = groupMap.get(lower)
+    if (!entry) {
+      entry = { rawName: String(rawName), values: [] }
+      groupMap.set(lower, entry)
+      groupOrder.push(lower)
+    }
+    entry.values.push(String(value))
+  }
+  const out = []
+  for (const lower of groupOrder) {
+    const entry = groupMap.get(lower)
+    if (entry.values.length === 1) {
+      out.push([entry.rawName, entry.values[0]])
+    } else {
+      out.push([entry.rawName, entry.values])
+    }
   }
   return out
 }
@@ -319,9 +356,15 @@ export function pipeResponse(upstreamReq, clientRes, onTapLine) {
     const status = typeof upstreamRes.statusCode === "number" ? upstreamRes.statusCode : 200
     clientRes.statusCode = status
 
-    // 2. Headers — copy everything except hop-by-hop.
-    const fwdHeaders = pickForwardableHeaders(upstreamRes.headers || {})
-    for (const [k, v] of Object.entries(fwdHeaders)) {
+    // 2. Headers — copy everything except hop-by-hop. R7/D4: iterate
+    // rawHeaders (alternating [name, value] array, preserving case and
+    // multi-value ordering) instead of upstreamRes.headers (Node already
+    // lowercased the keys AND collapsed repeated names). Multi-value
+    // headers are aggregated to a single array-valued setHeader() call
+    // so Node emits every value on the wire rather than dropping all but
+    // the last (which is what naive repeated setHeader(name, v) does).
+    const fwdHeaders = pickForwardableHeadersFromRawHeaders(upstreamRes.rawHeaders)
+    for (const [k, v] of fwdHeaders) {
       try {
         clientRes.setHeader(k, v)
       } catch (err) {

@@ -255,7 +255,7 @@ export const DEFAULT_CONFIG = Object.freeze({
         showCompression: false,
         summaryBuffer: true,
         maxContextLimit: 100000,
-        minContextLimit: 50000,
+        minContextLimit: 30000,
         nudgeFrequency: 5,
         iterationNudgeThreshold: 15,
         nudgeForce: "soft",

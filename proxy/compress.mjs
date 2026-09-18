@@ -191,7 +191,7 @@ function restoreSummary(storedSummary) {
     return result
 }
 
-function wrapCompressedSummary(blockId, summary) {
+export function wrapCompressedSummary(blockId, summary) {
     const footer = `<dcp-message-id>b${blockId}</dcp-message-id>`
     const body = (summary || "").trim()
     if (body.length === 0) return `${COMPRESSED_BLOCK_HEADER}\n${footer}`

@@ -1,6 +1,6 @@
 {
   "name": "zcode-dcp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Dynamic Context Pruning for ZCode — prunes obsolete tool outputs from model context via local proxy (port of opencode-dcp)",
   "description_i18n": {
     "en": "Dynamic Context Pruning for ZCode — local proxy that prunes obsolete tool outputs (port of opencode-dcp)",
@@ -10,7 +10,7 @@
     "name": "port-opencode-dcp-to-zcode project"
   },
   "license": "AGPL-3.0-or-later",
-  "homepage": "https://github.com/yuxiaoxiao2025/zcode-dcp",
+  "homepage": "https://github.com/Opencode-DCP/opencode-dynamic-context-pruning",
   "keywords": [
     "context",
     "pruning",

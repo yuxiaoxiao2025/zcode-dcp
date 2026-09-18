@@ -217,6 +217,32 @@ function adminGet(port, p, headerName, headerValue) {
   })
 }
 
+/**
+ * Poll a jsonl file until it has at least `expectedLines` non-empty lines,
+ * or until `timeoutMs` elapses. Returns the current lines array (possibly
+ * shorter than expected if the deadline was hit).
+ *
+ * Used by integration tests that depend on the daemon's fire-and-forget
+ * appendRequestLine write landing before the assertion. The daemon
+ * explicitly does NOT block the response on stats I/O (daemon.mjs:472),
+ * so the libuv-threadpool write can race the response handler.
+ */
+async function waitForJsonlLines(jsonlFile, expectedLines, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs
+  let lastLines = []
+  while (Date.now() < deadline) {
+    try {
+      const text = fs.readFileSync(jsonlFile, "utf8")
+      lastLines = text.split("\n").filter((l) => l.length > 0)
+      if (lastLines.length >= expectedLines) return lastLines
+    } catch {
+      // File may not exist yet — keep polling
+    }
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  return lastLines
+}
+
 // Find message slice byte indices in a serialized JSON body buffer. Used by
 // the bytes-slice comparator in contract 1. Byte-level (not char-level) so
 // CJK content in the body (e.g. embedded Chinese in `system` or messages)
@@ -471,9 +497,18 @@ test("contract-2: SSE stream is byte-faithful and tee extracts usage from both p
       _emitResponse() {
         if (!this._responseCb) throw new Error("no response listener")
         const r = this._responseCb
+        // Real Node IncomingMessage always populates BOTH `headers`
+        // (lowercased keys, multi-values merged) AND `rawHeaders`
+        // (alternating [name, value] array, original case, no merge).
+        // R7/D4 reads `rawHeaders` exclusively — provide it so the mock
+        // faithfully models the contract under test.
         const upstreamRes = {
           statusCode: 200,
           headers: { "content-type": "text/event-stream", "x-foo": "bar" },
+          rawHeaders: [
+            "Content-Type", "text/event-stream",
+            "X-Foo", "bar",
+          ],
           on(ev, cb) {
             if (ev === "data") {
               // Emit two chunks that together form one SSE line, then close.
@@ -843,6 +878,114 @@ test("contract-8: usage tee persisted per-fp (admin/stats reflects recent reques
     const statsBody = JSON.parse(statsResp.rawBody.toString("utf8"))
     assert.ok(statsBody && typeof statsBody === "object")
     assert.ok(statsBody.requests >= 1, "stats must show >=1 request")
+  } finally {
+    await stopTestDaemon(handle)
+    await upstream.stop()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
+// ===========================================================================
+// CONTRACT A2 — Gate 1.5 A2 sentTokens full-denominator (incl. tools)
+// ===========================================================================
+//
+// H2 / 08 问③: stats.sentTokens and the jsonl `sent` field are both
+// derived from the same `estimateBodyTokens(body)` call inside the
+// daemon's /v1/messages handler. Post-fix that estimator counts tool
+// definitions too. This test sends a request with a non-trivial tools
+// array and verifies the jsonl line `sent` matches stats-all `sentTokens`
+// (the "同源一致" invariant — fixing one without the other would split
+// the surface, which is exactly the bug we're closing).
+test("contract-A2: jsonl sent === stats-all sentTokens with tools array (同源一致)", async () => {
+  const upstream = await startCaptureUpstream((req, res) => {
+    res.statusCode = 200
+    res.setHeader("content-type", "text/event-stream")
+    res.end(fs.readFileSync(SSE_FIXTURE))
+  })
+  const { handle, dataDir } = await startTestDaemon({
+    upstream: { baseUrl: "http://127.0.0.1:" + upstream.port, apiKey: "K" },
+  })
+  try {
+    const tok = fs.readFileSync(path.join(dataDir, "admin-token"), "utf8").trim()
+
+    // Body with 3 non-trivial tool definitions (~100 chars schema each).
+    // Pre-fix this would yield identical jsonl/stat counts with vs
+    // without the tools array; post-fix both surfaces MUST include the
+    // tools component and MUST agree with each other.
+    const body = Buffer.from(JSON.stringify({
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 16,
+      stream: true,
+      system: [{ type: "text", text: "You are ZCode." }],
+      messages: [{ role: "user", content: "inspect the auth module" }],
+      tools: [
+        {
+          name: "Read",
+          description: "Reads a file from the local filesystem. Returns the file contents and metadata.",
+          input_schema: {
+            type: "object",
+            properties: { file_path: { type: "string" } },
+            required: ["file_path"],
+          },
+        },
+        {
+          name: "Edit",
+          description: "Performs an exact string replace in a file.",
+          input_schema: {
+            type: "object",
+            properties: { file_path: { type: "string" }, old_text: { type: "string" }, new_text: { type: "string" } },
+            required: ["file_path", "old_text", "new_text"],
+          },
+        },
+        {
+          name: "Bash",
+          description: "Executes a shell command and returns stdout/stderr.",
+          input_schema: {
+            type: "object",
+            properties: { command: { type: "string" }, timeout: { type: "number" } },
+            required: ["command"],
+          },
+        },
+      ],
+    }), "utf8")
+    await postMessages(handle.port, body, { authorization: "Bearer " + tok })
+
+    // 1. Read the per-request jsonl line (D3a) — `sent` is the request's
+    //    sentTokens from the post-fix estimator.
+    //
+    // RACE NOTE: appendRequestLine is invoked fire-and-forget by the daemon
+    // (the request-forwarding path is NOT blocked by stats I/O — see
+    // daemon.mjs:472-479). postMessages returns when the upstream response
+    // lands, which can race the libuv-threadpool jsonl write. Poll the file
+    // until exactly one line appears (or the deadline expires) so the test
+    // is timing-tolerant on slow CI hosts.
+    const jsonlFile = path.join(dataDir, "stats", "requests.jsonl")
+    const lines = await waitForJsonlLines(jsonlFile, 1, 2000)
+    assert.equal(lines.length, 1, "exactly one request appended")
+    const rec = JSON.parse(lines[0])
+    assert.equal(typeof rec.sent, "number")
+    assert.ok(rec.sent > 0, `jsonl.sent must be > 0 for a non-empty request; got ${rec.sent}`)
+
+    // 2. Read stats-all.json (all-time aggregate). The single request's
+    //    sent must equal the aggregate's sentTokens (no other requests
+    //    landed in this isolated tmpdir).
+    const allTime = JSON.parse(fs.readFileSync(path.join(dataDir, "stats-all.json"), "utf8"))
+    assert.equal(typeof allTime.sentTokens, "number")
+    assert.equal(
+      allTime.sentTokens, rec.sent,
+      `jsonl.sent (${rec.sent}) must equal stats-all.sentTokens (${allTime.sentTokens}) — both derived from the same estimateBodyTokens call`,
+    )
+
+    // 3. Sanity: sent must reflect the tools component. ~3 tool defs ×
+    //    ~200 chars / 4 ≈ 150 tokens. The pre-fix estimator would have
+    //    returned ~system + messages only (≈ 30 tokens for the fixture
+    //    above). We assert a generous lower bound to leave room for
+    //    estimator variance while still proving the tools component
+    //    is being counted.
+    assert.ok(
+      rec.sent >= 50,
+      `jsonl.sent must include the tools component (≥ 50 tokens for 3 non-trivial tool defs); got ${rec.sent}`,
+    )
   } finally {
     await stopTestDaemon(handle)
     await upstream.stop()
@@ -1628,6 +1771,172 @@ test("contract-19: /v1/messages inbound auth gate (D7 — no admin token = 401)"
     const statsBody = JSON.parse(statsResp.rawBody.toString("utf8"))
     assert.equal(statsBody.requests, 2,
       `stats.requests must count only authorised requests (expected 2, got ${statsBody.requests})`)
+  } finally {
+    await stopTestDaemon(handle)
+    await upstream.stop()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
+// ===========================================================================
+// CONTRACT 20 — R7/D4: response header case preservation + multi-value
+//                aggregation. Upstream emits mixed-case header NAMES
+//                (X-Custom-Case, X-FOO-BAR) AND multiple Set-Cookie headers.
+//                The daemon must:
+//                  (a) preserve the original case of header NAMES in the
+//                      proxied response (currently lowercased — bug #6);
+//                  (b) forward BOTH Set-Cookie values, not just the last
+//                      (currently `setHeader` overwrites — bug);
+//                  (c) continue stripping hop-by-hop response headers per
+//                      RFC 7230 §6.1 (no regression of contract-1 invariant).
+//
+//                Asserted via the client's `res.rawHeaders` (alternating
+//                [name, value, name, value, ...] preserving case AND order)
+//                and `res.headers` (lowercased object view).
+// ===========================================================================
+
+test("contract-20: response header case preserved + multi Set-Cookie aggregated (R7/D4)", async () => {
+  // Upstream uses res.writeHead with a raw header LINES array (the form
+  // that takes Array<[name, value]>) so we have full control over the wire
+  // bytes the upstream emits — including duplicate Set-Cookie names and
+  // mixed-case header names. Node's ServerResponse accepts this form and
+  // emits exactly those name/value pairs without re-casing or folding.
+  const upstream = await startCaptureUpstream((req, res) => {
+    const body = Buffer.from('{"ok":true,"r7":"passthrough"}', 'utf8')
+    const headers = [
+      ["Content-Type", "application/json"],
+      ["X-Custom-Case", "v1"],            // mixed case (currently lowercased)
+      ["Set-Cookie", "a=1; Path=/"],      // cookie 1 (currently dropped)
+      ["Set-Cookie", "b=2; Path=/"],      // cookie 2 (kept by mistake)
+      ["X-FOO-BAR", "baz"],               // all uppercase (currently lowercased)
+      ["Upgrade", "websocket"],           // hop-by-hop → must be stripped
+      ["Proxy-Connection", "keep-alive"], // hop-by-hop → must be stripped
+      ["Content-Length", String(body.length)],
+    ]
+    res.writeHead(200, headers)
+    res.end(body)
+  })
+
+  const { handle, dataDir } = await startTestDaemon({
+    upstream: { baseUrl: "http://127.0.0.1:" + upstream.port, apiKey: "K" },
+  })
+  try {
+    // Custom request: postMessages helper doesn't expose rawHeaders. We
+    // need rawHeaders on the CLIENT side to assert case preservation +
+    // multi-value ordering.
+    const tok = fs.readFileSync(path.join(dataDir, "admin-token"), "utf8").trim()
+    const body = Buffer.from(JSON.stringify({
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 8,
+      stream: false,
+      messages: [{ role: "user", content: "r7-probe" }],
+    }), "utf8")
+
+    const proxied = await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          host: "127.0.0.1",
+          port: handle.port,
+          path: "/v1/messages",
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "content-length": body.length,
+            "authorization": "Bearer " + tok,
+          },
+        },
+        (res) => {
+          const chunks = []
+          res.on("data", (c) => chunks.push(c))
+          res.on("end", () => resolve({
+            statusCode: res.statusCode,
+            headers: res.headers,
+            rawHeaders: res.rawHeaders,
+            rawBody: Buffer.concat(chunks),
+          }))
+        },
+      )
+      req.on("error", reject)
+      req.write(body)
+      req.end()
+    })
+
+    assert.equal(proxied.statusCode, 200)
+    // H1 lock: response body must remain byte-faithful even when we add
+    // header handling logic (regression guard for contract-1/contract-2).
+    assert.ok(
+      proxied.rawBody.equals(Buffer.from('{"ok":true,"r7":"passthrough"}', "utf8")),
+      "response body must remain byte-faithful (H1 lock; contract-1 regression)",
+    )
+
+    // ---- Assertion 1: header NAMES preserve original case ----
+    // res.rawHeaders is alternating [name, value, name, value, ...] and
+    // preserves the case of each name. Walk even indices for names.
+    const names = []
+    for (let i = 0; i < proxied.rawHeaders.length; i += 2) {
+      names.push(proxied.rawHeaders[i])
+    }
+    assert.ok(
+      names.includes("X-Custom-Case"),
+      `mixed-case X-Custom-Case must be preserved verbatim; got names=${JSON.stringify(names)}`,
+    )
+    assert.ok(
+      names.includes("X-FOO-BAR"),
+      `uppercase X-FOO-BAR must be preserved verbatim; got names=${JSON.stringify(names)}`,
+    )
+    // Lowercased variants must NOT appear (proves the daemon did not emit
+    // them under a different case — bug #6 regression guard).
+    assert.ok(
+      !names.includes("x-custom-case"),
+      `lowercased x-custom-case must NOT be re-emitted; got names=${JSON.stringify(names)}`,
+    )
+    assert.ok(
+      !names.includes("x-foo-bar"),
+      `lowercased x-foo-bar must NOT be re-emitted; got names=${JSON.stringify(names)}`,
+    )
+
+    // ---- Assertion 2: BOTH Set-Cookie values forwarded ----
+    // Walk rawHeaders looking for Set-Cookie entries (case-insensitive on
+    // the NAME side — RFC 7230 §3.2 says header names are case-insensitive).
+    const cookieValues = []
+    for (let i = 0; i < proxied.rawHeaders.length; i += 2) {
+      if (String(proxied.rawHeaders[i]).toLowerCase() === "set-cookie") {
+        cookieValues.push(proxied.rawHeaders[i + 1])
+      }
+    }
+    assert.equal(
+      cookieValues.length,
+      2,
+      `expected exactly 2 Set-Cookie entries in proxied rawHeaders, got ${cookieValues.length}: ${JSON.stringify(cookieValues)}`,
+    )
+    assert.ok(
+      cookieValues.some((v) => v && v.startsWith("a=1;")),
+      "first Set-Cookie value (a=1;...) must be forwarded (regression guard for multi-value collapse)",
+    )
+    assert.ok(
+      cookieValues.some((v) => v && v.startsWith("b=2;")),
+      "second Set-Cookie value (b=2;...) must be forwarded — current implementation drops all but the last setHeader call",
+    )
+
+    // ---- Assertion 3: hop-by-hop headers stripped (no regression) ----
+    // The upstream sent `Upgrade: websocket` and `Proxy-Connection: keep-alive`.
+    // Neither must appear in the proxied response (RFC 7230 §6.1).
+    for (const hh of ["upgrade", "proxy-connection"]) {
+      assert.equal(
+        proxied.headers[hh],
+        undefined,
+        `${hh} must be stripped from proxied response (hop-by-hop regression)`,
+      )
+    }
+    // Same check via rawHeaders walk — confirms the byte stream itself does
+    // not contain the header, not just the lowercased object view.
+    for (let i = 0; i < proxied.rawHeaders.length; i += 2) {
+      const nm = String(proxied.rawHeaders[i]).toLowerCase()
+      assert.ok(
+        nm !== "upgrade" && nm !== "proxy-connection",
+        `hop-by-hop header ${nm} must NOT appear in proxied rawHeaders`,
+      )
+    }
   } finally {
     await stopTestDaemon(handle)
     await upstream.stop()

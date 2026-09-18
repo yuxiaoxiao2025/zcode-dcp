@@ -8,8 +8,6 @@ It prunes obsolete tool outputs from the model context via a local proxy
 (`127.0.0.1:8367`), reducing token spend on long sessions while leaving
 session history and the UI untouched.
 
-[![test](https://github.com/yuxiaoxiao2025/zcode-dcp/actions/workflows/test.yml/badge.svg)](https://github.com/yuxiaoxiao2025/zcode-dcp/actions/workflows/test.yml)
-
 ---
 
 ## What
@@ -54,58 +52,33 @@ Pruning strategies (ported 1:1 from DCP v3.1.15):
 - **Nudge injection** — when context approaches the configured limit,
   the proxy injects a nudge message guiding the model to compress.
 
-Protected tools (`TodoWrite`, `Agent`, `Skill`, `Write`, `Edit`, …) are
-never pruned.
+Hardcoded skip list: outputs of `Write` / `Edit` / `AskUserQuestion`
+(plus their lowercase opencode forms, matched case-insensitively) are
+never replaced by dedup placeholders. Everything else — including
+`TodoWrite`, `Agent`, `Skill` — is eligible for dedup by default, which
+matches upstream DCP (its dedup protection also defaults to empty); add
+tool names to `strategies.*.protectedTools` to protect them.
 
 ---
 
 ## Install
 
-The repo root **is** the plugin (marketplace manifest at
-`.claude-plugin/marketplace.json`, plugin source `./`). Two ways to install:
+The plugin ships in this repo under `zcode-dcp/` plus a local marketplace
+manifest at `local-marketplace/marketplace.json`. Install it from a local
+marketplace:
 
-### Option 1 — git marketplace (recommended, no clone needed)
-
-1. **Add the marketplace.** Settings → Plugins → Add plugin marketplace →
-   pick **Git repository** → enter `https://github.com/yuxiaoxiao2025/zcode-dcp`.
-2. **Install and enable** `zcode-dcp`.
-
-### Option 2 — local directory (offline machines / your own fork)
-
-1. **Clone this repo** anywhere (or download the zip and extract it).
-2. Create a `marketplace.json` in its own folder, replacing
-   `<absolute-path-to-your-clone>` with the real path:
-
-   ```json
-   {
-     "name": "zcode-dcp-local",
-     "plugins": [
-       {
-         "name": "zcode-dcp",
-         "source": { "source": "directory", "path": "<absolute-path-to-your-clone>" },
-         "description": "Dynamic Context Pruning for ZCode (local copy)",
-         "version": "0.1.4"
-       }
-     ]
-   }
-   ```
-
-   > The `path` must be **absolute** — the ZCode client does not support
-   > relative traversal in directory sources.
-3. Settings → Plugins → Add plugin marketplace → pick **Local directory** →
-   select that folder. Install and enable `zcode-dcp`.
-
-### After installing (both options)
-
-1. **Restart ZCode or open a new session.** Plugin hooks and the MCP
+1. **Add the local marketplace.** Settings → Plugins → Create → Add
+   plugin marketplace → pick **Local directory** → select the repo's
+   `local-marketplace/` folder. Install and enable `zcode-dcp`.
+2. **Restart ZCode or open a new session.** Plugin hooks and the MCP
    server are snapshotted per session.
-2. **Confirm the proxy is up.** In a new session, run `/dcp-stats`. It
+3. **Confirm the proxy is up.** In a new session, run `/dcp-stats`. It
    should return statistics. (If it reports `daemon unreachable`, restart
    ZCode, or run `node <plugin root>/hooks/session-start.mjs`.)
-3. **Read the admin token.** The plugin data directory lives under
+4. **Read the admin token.** The plugin data directory lives under
    `~/.zcode/cli/plugins/data/` (look for the `zcode-dcp`-related
    folder). `cat` the `admin-token` file inside it.
-4. **Add the proxy as a ZCode custom provider — must be done through the
+5. **Add the proxy as a ZCode custom provider — must be done through the
    UI.** Hand-editing `~/.zcode/v2/config.json` or `cli/config.json`
    does **not** take effect: the UI only honors its own registry, and
    `config.json` is a one-way export bridge.
@@ -116,11 +89,11 @@ The repo root **is** the plugin (marketplace manifest at
    - API Key: paste the `admin-token` contents (**must not be empty**)
    - Model ID: `GLM-5.3` (or any model ID your upstream supports)
    - Enable the provider
-5. **Switch the model selector** to that provider's model.
-6. **Verify.** Run a task with repeated file reads, then `/dcp-stats`
+6. **Switch the model selector** to that provider's model.
+7. **Verify.** Run a task with repeated file reads, then `/dcp-stats`
    again to see the savings.
 
-> The UI provider you add in step 4 points to the local proxy
+> The UI provider you add in step 5 points to the local proxy
 > (`http://127.0.0.1:8367`). The proxy's `upstream.baseUrl` /
 > `upstream.apiKey` (configured below in `dcp.jsonc`) point to your real
 > model endpoint. These are two different things.
@@ -139,7 +112,7 @@ autocompletion:
 
 ```jsonc
 {
-  "$schema": "./dcp.schema.json",
+  "$schema": "./zcode-dcp/dcp.schema.json",
   "upstream": {
     "baseUrl": "https://open.bigmodel.cn/api/anthropic",
     "apiKey": "your-real-provider-key"
@@ -174,7 +147,7 @@ Config changes take effect in **new sessions**.
 
 Everything else (`strategies`, `compress`, `manualMode`,
 `protectedFilePatterns`, …) is carried over from the upstream DCP
-schema. See `dcp.schema.json` at the repo root for the full reference.
+schema. See `zcode-dcp/dcp.schema.json` for the full reference.
 
 ---
 
@@ -185,12 +158,12 @@ schema. See `dcp.schema.json` at the repo root for the full reference.
 | Command                | Effect                                                              |
 |------------------------|---------------------------------------------------------------------|
 | `/dcp-compress [focus]` | Manually trigger a compression (optionally with a focus string).    |
-| `/dcp-stats`            | Real sent / saved tokens, per-strategy hits, cache hit rate.        |
+| `/dcp-stats`            | Real sent / saved tokens, per-strategy hits, savings rate (saved/(sent+saved)). |
 | `/dcp-context`          | Estimated composition of the assembled context.                     |
-| `/dcp-sweep [N]`        | Immediately sweep tool outputs (all, or the last N).                |
+| `/dcp-sweep [N]`        | Sweep the most recent N tool calls (or, with no arg, all calls since the previous user message). Effect is applied on the session's next request (delayed-apply semantics; see docs/current/CAPABILITY-MAPPING.md). |
 | `/dcp-manual on\|off`   | Toggle manual mode for automatic strategies.                        |
-| `/dcp-decompress [n]`   | Decompress a previously compressed block (no arg = list them).      |
-| `/dcp-recompress [n]`   | Re-apply a previously decompressed block.                           |
+| `/dcp-decompress [n]`   | No-arg lists the available compression blocks (`b<N> (~T tokens) - topic`); with `n` restores block N (adds to the exclusion list; original messages return on the next request). |
+| `/dcp-recompress [n]`   | Re-apply all compressions (clears exclusions, turns manual mode off). |
 | `/dcp-setup`            | Print the install / provider-setup walkthrough.                     |
 
 ### Model-driven tools
@@ -222,9 +195,11 @@ through the external proxy and the local daemon becomes unreachable.
 
 The proxy preserves three independent signals:
 
-1. **Real usage / cache hit rate.** Taken from the upstream response
-   `usage` block, which the proxy forwards byte-for-byte. **Updates
-   normally and reflects the real post-pruning spend.**
+1. **Real usage / upstream prompt-cache stats.** Taken from the upstream
+   response `usage` block, which the proxy forwards byte-for-byte.
+   **Updates normally and reflects the real post-pruning spend.** (This
+   is the upstream cache figure — distinct from the *savings rate*
+   shown by `/dcp-stats`, which is a local saved/(sent+saved) ratio.)
 2. **Context capacity (main number + per-category breakdown — MCP
    tools / system tools / messages / skills / system prompt).** ZCode
    estimates these locally from the assembled request it was about to
@@ -237,6 +212,12 @@ The proxy preserves three independent signals:
 
 To see the **real sent vs saved** breakdown including per-strategy hits,
 run `/dcp-stats` at any time.
+
+**Three counters' surface split (v0.1.5+):** the proxy's `sentTokens`
+(and the per-request jsonl `sent` field) count **system + tools + messages**
+— the full billable surface. The MCP tools report the same total. ZCode's
+own pre-flight panel still uses its own local estimator that may not
+include tool definitions; if the two disagree, trust the proxy number.
 
 ---
 
@@ -257,10 +238,14 @@ Listed honestly, with the reason for each:
    and `/dcp-recompress` may operate on the other window's session id.
    *Automatic* pruning (dedup / purge / nudges) is unaffected — it is
    derived from request history.
-4. **`sentTokens` estimate excludes tool definitions.** ZCode's local
-   context counter does not count the bytes of the tool definitions
-   themselves. For "tokens actually billed" always trust upstream
-   `usage`.
+4. **`sentTokens` estimate includes tool definitions (since v0.1.5).** The
+   daemon's local sentTokens counter now sums tool definitions into the
+   total — same estimator as `tool_use` blocks (whole block serialised).
+   The proxy's displayed "sent" therefore reflects the full billable
+   surface (system + tools + messages). ZCode's own pre-flight panel
+   (shown in the IDE before the request goes out) still estimates
+   differently and may show a lower number; for "tokens actually
+   billed" always trust upstream `usage`.
 5. **`EADDRINUSE` if something else holds the port.** Change
    `proxy.port` in `dcp.jsonc` (and re-add the provider in step 5 with
    the new URL).
@@ -268,6 +253,11 @@ Listed honestly, with the reason for each:
    changes the message prefix, prompt-cache reuse drops temporarily.
    Empirically (DCP upstream tests): ~85% with pruning vs ~90% direct.
    For long sessions the total token saving is still positive.
+7. **Windows CRLF checkouts fail 2 command-file tests.** With
+   `core.autocrlf=true`, two command-frontmatter tests fail on the
+   trailing `\r`; run the suite from an LF checkout
+   (`git -c core.autocrlf=false archive …`) or set
+   `.gitattributes`-style LF handling.
 
 ---
 
@@ -284,23 +274,11 @@ Listed honestly, with the reason for each:
 
 ---
 
-## Development
-
-Zero dependencies — run the test suite with `node --test test/*.test.mjs`
-(Node 22+; the suite relies on V8 JSON error messages with position info
-and is verified on Node 22/24). Note: the integration tests in
-`test/mcp.test.mjs` use Windows process helpers (`cmd.exe` / `taskkill`)
-for daemon cleanup, so the full suite currently requires Windows (CI runs
-on `windows-latest`). The plugin runtime code itself is pure
-cross-platform Node.
-
----
-
 ## License
 
 `AGPL-3.0-or-later`. Derived from `@tarquinen/opencode-dcp` v3.1.15.
 Per-module source attribution and the full capability-mapping table
 (port: 16 / downgraded: 9 / partial: 1 / infeasible: 3 / not-applicable: 3)
-live at [`docs/CAPABILITY-MAPPING.md`](./docs/CAPABILITY-MAPPING.md).
+live at `docs/current/CAPABILITY-MAPPING.md` after release.
 
 See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE) for details.

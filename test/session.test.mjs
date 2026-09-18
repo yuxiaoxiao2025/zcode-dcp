@@ -220,6 +220,10 @@ describe("loadLightState / saveLightState", () => {
       sweepToolCallIds: [],
       decompressBlockIds: [],
       manualMode: false,
+      maxRunIdSeen: null,
+      sweepDirective: null,
+      sweepLastResult: null,
+      activeBlockSummaries: [],
     })
   })
 
@@ -230,6 +234,10 @@ describe("loadLightState / saveLightState", () => {
       sweepToolCallIds: ["toolu_01", "toolu_02"],
       decompressBlockIds: ["b2"],
       manualMode: true,
+      maxRunIdSeen: 5,
+      sweepDirective: null,
+      sweepLastResult: null,
+      activeBlockSummaries: [],
     }
     session.saveLightState(dataDir, fp, st)
     const loaded = session.loadLightState(dataDir, fp)
@@ -253,6 +261,10 @@ describe("loadLightState / saveLightState", () => {
       sweepToolCallIds: [],
       decompressBlockIds: [],
       manualMode: false,
+      maxRunIdSeen: null,
+      sweepDirective: null,
+      sweepLastResult: null,
+      activeBlockSummaries: [],
     })
   })
 
@@ -305,6 +317,10 @@ describe("loadLightState / saveLightState", () => {
         sweepToolCallIds: [],
         decompressBlockIds: [],
         manualMode: false,
+        maxRunIdSeen: null,
+        sweepDirective: null,
+        sweepLastResult: null,
+        activeBlockSummaries: [],
       }, `loadLightState should reject fp=${JSON.stringify(bad)}`)
       session.saveLightState(dataDir, bad, {
         anchors: { context: ["m0001"], turn: [], iter: [] },

@@ -61,6 +61,11 @@
 // are NEVER touched — passthrough is structurally guaranteed.
 
 import { isMainSession } from "./protect.mjs"
+import {
+  isToolNameProtected,
+  isFilePathProtected,
+  getFilePathsFromParameters,
+} from "./protect.mjs"
 import { stripDcpTags, assignRefs, injectMessageIds } from "./message-ids.mjs"
 import {
   deriveBlocks,
@@ -263,7 +268,8 @@ function buildBlockedSet(messages, config) {
  *   body                : { ...body, messages: transformed } (shallow merge,
  *                         every non-messages field passed by reference)
  *   metrics             : { savedTokensEst, byStrategy, injectedNudges,
- *                          activeBlocks, skipped?, nudgeStarved?, compressError? }
+ *                          activeBlocks, skipped?, nudgeStarved?, compressError?,
+ *                          maxRunId }
  *   lightStateUpdates   : { anchors, fetchCount, ... } — caller persists this
  *
  * ctx shape:
@@ -306,6 +312,10 @@ export function transformRequest(body, ctx) {
       metrics: {
         savedTokensEst: 0,
         byStrategy: { dedup: 0, purge: 0, compress: 0 },
+        // R8.3 / DESIGN D3: gate-rejected requests never run prune/compress,
+        // so all four token buckets are zero. Exposed here for shape
+        // consistency with the gate-passed branch.
+        savedTokensByStrategy: { dedup: 0, purge: 0, sweep: 0, compress: 0 },
         injectedNudges: 0,
         activeBlocks: 0,
         skipped: "gate",
@@ -392,6 +402,18 @@ export function transformRequest(body, ctx) {
       for (const idx of b.coveredIndices) coveredIndices.add(idx)
     }
   }
+  // Gate 1.5 A1: compute covered-originals tokens BEFORE applyCompressions
+  // mutates the messages array. The pre-fix estimator summed
+  // (rawSummary.length − enhancedSummary.length)/4, which is ~0 for any
+  // well-behaved compress call (the model writes a concise summary).
+  // The fix uses the covered union tokens minus the inserted synthetic
+  // tokens — the real on-the-wire savings. Nested consume is naturally
+  // handled: consumed blocks are filtered out by filterActiveBlocks, so
+  // only ACTIVE blocks contribute to coveredIndices and syntheticTokens
+  // (their covered indices are subsumed by the outer block's range).
+  const coveredOriginalTokens = activeBlocks.length > 0 && coveredIndices.size > 0
+    ? sumTokensForIndices(messages, coveredIndices)
+    : 0
   if (activeBlocks.length > 0) {
     messages = applyCompressions(messages, activeBlocks, enhancedSummaries)
   }
@@ -421,16 +443,17 @@ export function transformRequest(body, ctx) {
     }
   }
   let prunePlan = planPrune(messages, pruneCfg)
+  let sweepDirectiveResult = null
   // Wire sweepToolCallIds from the user's MCP-driven `/dcp-admin/state/sweep`
-  // action into the prune set. These are tool_use ids the operator explicitly
-  // marked "sweep" via MCP (DCP `sweepToolCallIds` semantics — the user's
-  // earlier sweep marks carry across requests; without merging them here
-  // the field is dead state in the proxy). After merging, re-estimate
-  // savedTokensEst so the metrics reflect the sweep's contribution (planPrune
-  // only accounted for the strategy-picked ids).
   const sweepIds = Array.isArray(lightState.sweepToolCallIds) ? lightState.sweepToolCallIds : []
   if (sweepIds.length > 0 && prunePlan.pruneToolCallIds instanceof Set) {
     if (!Array.isArray(prunePlan.byStrategy.sweep)) prunePlan.byStrategy.sweep = []
+    if (!prunePlan.byStrategyTokens || typeof prunePlan.byStrategyTokens !== "object") {
+      prunePlan.byStrategyTokens = { dedup: 0, purge: 0, sweep: 0 }
+    }
+    if (typeof prunePlan.byStrategyTokens.sweep !== "number") {
+      prunePlan.byStrategyTokens.sweep = 0
+    }
     for (const id of sweepIds) {
       if (typeof id === "string" && id.length > 0 && !prunePlan.pruneToolCallIds.has(id)) {
         prunePlan.pruneToolCallIds.add(id)
@@ -438,7 +461,8 @@ export function transformRequest(body, ctx) {
       }
     }
     // Re-estimate saved tokens for the sweep additions only (the strategy
-    // picks were already accounted for in planPrune's estimate).
+    // picks were already accounted for in planPrune's estimate). The per-block
+    // estimate is added to both savedTokensEst and byStrategyTokens.sweep.
     for (const id of prunePlan.byStrategy.sweep) {
       for (let i = 0; i < messages.length; i++) {
         const m = messages[i]
@@ -446,15 +470,89 @@ export function transformRequest(body, ctx) {
         for (const p of m.content) {
           if (!p || typeof p !== "object") continue
           if (p.type === "tool_use" && p.id === id) {
-            prunePlan.savedTokensEst += estimateMessageTokens({ content: [p] })
+            const blockEstimate = estimateMessageTokens({ content: [p] })
+            prunePlan.savedTokensEst += blockEstimate
+            prunePlan.byStrategyTokens.sweep += blockEstimate
           } else if (
             p.type === "tool_result" &&
             p.tool_use_id === id
           ) {
-            prunePlan.savedTokensEst += estimateMessageTokens({ content: [p] })
+            const blockEstimate = estimateMessageTokens({ content: [p] })
+            prunePlan.savedTokensEst += blockEstimate
+            prunePlan.byStrategyTokens.sweep += blockEstimate
           }
         }
       }
+    }
+  }
+  // Gate 1.5 B2 — consume the operator's `sweepDirective` (one-shot).
+  //
+  // DCP upstream applies sweep IMMEDIATELY in the handler because state is
+  // a mutable live object. In the ZCode proxy architecture the handler
+  // cannot see the messages — only the pipeline can, on the next inbound
+  // request. So we queue a directive via /dcp-admin/state/sweep and consume
+  // it here, exactly where the prune plan runs (so applyPrune does the
+  // actual placeholder substitution).
+  //
+  // Skips applied:
+  //   - commands.protectedTools hits (DCP sweep.ts:178-180 verbatim) — bare
+  //     name comparison with MCP-prefix stripping (protect.mjs helper).
+  //   - protectedFilePatterns hits (DCP sweep.ts:184-186 verbatim) — file_path/
+  //     path parameter inspection via protect.mjs.
+  //   - already in the prune set from prior strategies (dedup/purge) — no
+  //     double-application.
+  //   - is_error=true tool_results (DCP purgeErrors semantics — error messages
+  //     are kept by design, only their inputs are cleaned. Sweep does NOT
+  //     touch errors; their detail is still useful in context.)
+  const directive = lightState && lightState.sweepDirective
+  if (
+    directive &&
+    typeof directive === "object" &&
+    (directive.mode === "since-user" || directive.mode === "last-n") &&
+    prunePlan.pruneToolCallIds instanceof Set
+  ) {
+    // Compute target ids from the live messages array.
+    const rawTargets = computeSweepTargetIds(messages, directive)
+    const targets = applySweepSkipRules(rawTargets, cfg)
+    // Filter to "actually applied" (not skipped) and "skipped-protected" (in
+    // target but rejected by a skip rule). These two counters feed
+    // sweepLastResult for operator-visible feedback (MCP dcp_sweep response).
+    const appliedIds = []
+    let skippedProtected = 0
+    if (!Array.isArray(prunePlan.byStrategy.sweep)) prunePlan.byStrategy.sweep = []
+    if (!prunePlan.byStrategyTokens || typeof prunePlan.byStrategyTokens !== "object") {
+      prunePlan.byStrategyTokens = { dedup: 0, purge: 0, sweep: 0 }
+    }
+    if (typeof prunePlan.byStrategyTokens.sweep !== "number") {
+      prunePlan.byStrategyTokens.sweep = 0
+    }
+    for (const target of targets) {
+      if (!target || typeof target.id !== "string" || target.id.length === 0) continue
+      // Skip errors — purgeErrors handles error-input cleaning separately.
+      if (isToolResultError(messages, target.id)) continue
+      if (prunePlan.pruneToolCallIds.has(target.id)) {
+        // Already picked up by dedup/purge — count as applied but don't
+        // re-estimate tokens (planPrune already accounted for it).
+        appliedIds.push(target.id)
+        continue
+      }
+      if (target.isProtected) {
+        skippedProtected++
+        continue
+      }
+      prunePlan.pruneToolCallIds.add(target.id)
+      prunePlan.byStrategy.sweep.push(target.id)
+      appliedIds.push(target.id)
+      // Estimate per-block tokens for the new sweep id (tool_use +
+      // tool_result pair) and add to both savedTokensEst and the per-
+      // strategy token split.
+      const est = estimateSweepBlockTokens(messages, target.id)
+      prunePlan.savedTokensEst += est
+      prunePlan.byStrategyTokens.sweep += est
+    }
+    sweepDirectiveResult = {
+      applied: appliedIds.length,
+      skippedProtected,
     }
   }
   messages = applyPrune(messages, prunePlan, coveredIndices)
@@ -529,10 +627,34 @@ export function transformRequest(body, ctx) {
   // Step 12: assemble the return. Other body fields pass through by
   // reference (D5: shallow merge). Metrics fold every observed savings
   // signal into a single shape the caller can persist into stats.
+  // Gate 1.5 A1: compressSavings = covered-original tokens − synthetic
+  // tokens, NOT (rawSummary − enhancedSummary). The latter is ~0 for
+  // every well-behaved compress call; the former is the real on-the-wire
+  // saving that the user actually sees in /dcp-stats. See
+  // estimateCompressSavings below for the full derivation.
   const compressSavings =
-    compressErrorMessage ? 0 : coveredIndices.size > 0
-      ? estimateCompressSavings(activeBlocks, enhancedSummaries)
+    compressErrorMessage ? 0 : activeBlocks.length > 0 && coveredIndices.size > 0
+      ? estimateCompressSavings(activeBlocks, enhancedSummaries, coveredOriginalTokens)
       : 0
+
+  // R3 / DESIGN D2: derive the maximum runId across ALL blocks (including
+  // excluded/decompressed ones — the runId was assigned at parse time
+  // regardless of whether the block survives to activeBlocks). The daemon
+  // uses this as the "newly observed compress calls" upper bound; one
+  // compress tool_use call contributes a single runId regardless of how
+  // many range entries it carries. We therefore take the MAX over the
+  // raw `blocks` array (NOT `activeBlocks` — consumed/nested/excluded
+  // blocks still count toward runId allocation). compressError implies
+  // blocks=[] (caught above), so maxRunId=0 in that case — daemon will
+  // skip the seen update via compressRunsDelta.
+  const maxRunId = compressErrorMessage
+    ? 0
+    : (Array.isArray(blocks) && blocks.length > 0
+        ? blocks.reduce((m, b) => {
+            const r = b && Number.isFinite(b.runId) ? b.runId : 0
+            return r > m ? r : m
+          }, 0)
+        : 0)
 
   const metrics = {
     savedTokensEst:
@@ -544,8 +666,28 @@ export function transformRequest(body, ctx) {
       sweep: (prunePlan && prunePlan.byStrategy && Array.isArray(prunePlan.byStrategy.sweep) ? prunePlan.byStrategy.sweep.length : 0),
       compress: activeBlocks.length,
     },
+    // R8.3 / DESIGN D3: per-strategy token split. Each bucket is the saved
+    // tokens attributable to that strategy. The four buckets sum to
+    // savedTokensEst by construction:
+    //   dedup + purge + sweep = prunePlan.savedTokensEst (the prune layer
+    //     is responsible for the dedup/purge split; sweep is the value
+    //     added by the lightState.sweepToolCallIds merge above)
+    //   compress = compressSavings (the value folded into savedTokensEst)
+    // The pipeline also exports savedTokensByStrategy for the per-request
+    // jsonl record (D3a) and for stats accumulation.
+    savedTokensByStrategy: {
+      dedup: (prunePlan && prunePlan.byStrategyTokens ? prunePlan.byStrategyTokens.dedup : 0),
+      purge: (prunePlan && prunePlan.byStrategyTokens ? prunePlan.byStrategyTokens.purge : 0),
+      sweep: (prunePlan && prunePlan.byStrategyTokens ? prunePlan.byStrategyTokens.sweep || 0 : 0),
+      compress: compressSavings,
+    },
     injectedNudges: nudgePlan.injections ? nudgePlan.injections.length : 0,
     activeBlocks: activeBlocks.length,
+    // R3 / DESIGN D2: daemon wires compressRuns via
+    //   stats.compressRunsDelta(maxRunId, lightState.maxRunIdSeen, !!compressError)
+    // The seen baseline lives in light-state; we only export this request's
+    // observed upper bound here.
+    maxRunId,
   }
   if (nudgePlan.skipped) metrics.skipped = nudgePlan.skipped
   if (compressErrorMessage) metrics.compressError = compressErrorMessage
@@ -562,7 +704,34 @@ export function transformRequest(body, ctx) {
   const lightStateUpdates = {
     anchors: nudgePlan.anchorUpdates || { context: [], turn: [], iter: [] },
     fetchCount: (lightState.fetchCount || 0) + 1,
+    // Gate 1.5 B2 — always clear the directive after the pipeline runs. The
+    // directive is a ONE-SHOT instruction consumed (and cleared) on the next
+    // request. If we cleared it before processing, a pipeline-throw would
+    // lose the directive; clearing it here, AFTER applyPrune, means the
+    // directive survives a transient failure and gets retried on the next
+    // request — matching the R11 idempotency contract for admin actions.
+    sweepDirective: null,
   }
+  // After consume: write the last-applied result so the next MCP dcp_sweep
+  // call can surface "Last sweep: applied N, M protected skipped." as
+  // operator-visible feedback. sweepLastResult is intentionally a separate
+  // field from sweepDirective (the directive is gone after consume).
+  if (sweepDirectiveResult) {
+    lightStateUpdates.sweepLastResult = sweepDirectiveResult
+  }
+
+  // Gate 1.5 B3 — write the per-request activeBlockSummaries to the
+  // lightStateUpdates so the daemon/MCP server can render the
+  // "dcp_decompress (no-arg)" list. The shape is what the admin endpoint
+  // serialises back in its {lightState} envelope. Each entry maps
+  // blockId (integer) → topic (verbatim from the compress tool_use) →
+  // approxTokens (estimated tokens the synthetic replacement would carry
+  // — i.e. the on-the-wire cost of the existing summary, NOT the savings).
+  // We rebuild this every request from `activeBlocks` so a stale summary
+  // can never survive an excluded block becoming active or vice versa.
+  // activeBlocks itself is already excluded-block-free (deriveBlocks drops
+  // them at the source) so the writer needs no further filtering.
+  lightStateUpdates.activeBlockSummaries = summarizeActiveBlocks(activeBlocks, enhancedSummaries)
 
   return {
     body: { ...safeBody, messages },
@@ -576,24 +745,153 @@ export function transformRequest(body, ctx) {
 // ---------------------------------------------------------------------------
 
 /**
- * Rough token-savings estimate for compress blocks: sum of the original
- * messages' tokens (estimation) minus the summary length tokens. Used for
- * stats display only — not for any control-flow decision.
+ * Sum `estimateMessageTokens` across the messages at the given integer
+ * indices. Used by estimateCompressSavings to compute the covered-original
+ * token total (the "what the upstream would have seen without this
+ * compress block" baseline). Indices are unique by construction (caller
+ * passes a Set), but we guard against undefined / out-of-range entries
+ * defensively.
+ *
+ * @param {Array<object>} messages
+ * @param {Set<number>} indices
+ * @returns {number} token total across the indexed messages
  */
-function estimateCompressSavings(activeBlocks, enhancedSummaries) {
-  // We have access to refs.byIndex, not the messages — so an exact recount
-  // is not possible here without re-walking. The pruning-side estimate is
-  // already accurate for dedup/purge; for compress we report the COUNT of
-  // active blocks as a coarse proxy (matches planPrune's "savedTokensEst"
-  // being a coarse sum of block tokens — task-9 stats display tolerance).
+function sumTokensForIndices(messages, indices) {
+  if (!Array.isArray(messages) || !indices || indices.size === 0) return 0
+  let total = 0
+  for (const idx of indices) {
+    if (!Number.isInteger(idx) || idx < 0 || idx >= messages.length) continue
+    total += estimateMessageTokens(messages[idx])
+  }
+  return total
+}
+
+/**
+ * Gate 1.5 B3 — build the `activeBlockSummaries` payload for the
+ * lightStateUpdates. Each entry has the operator-facing view of one
+ * active compress block:
+ *
+ *   { blockId, topic, approxTokens }
+ *
+ * `blockId` is the integer id (NOT the "bN" string — the admin endpoint
+ * serialises the list and the MCP server formats the same way; the
+ * numeric form is what `/dcp-admin/state/decompress?blockId=N` accepts).
+ *
+ * `topic` is verbatim from the compress tool_use's `input.topic`. Falls
+ * back to "" when missing.
+ *
+ * `approxTokens` is the on-the-wire token estimate of the synthetic
+ * summary that REPLACES the covered span in the next request. We
+ * re-use the same wrap that `applyCompressions` builds so the value
+ * matches what the upstream actually sees (defensive against drift if
+ * the wrap changes in the future). This is the same number the MCP
+ * server prints next to each block ("bN (~T tokens) - topic") — a
+ * positive integer that's stable across requests.
+ *
+ * @param {Array<object>} activeBlocks — post-step-5a active set
+ * @param {Map<string, string>} enhancedSummaries — blockId → summary text
+ * @returns {Array<{blockId:number, topic:string, approxTokens:number}>}
+ */
+function summarizeActiveBlocks(activeBlocks, enhancedSummaries) {
+  if (!Array.isArray(activeBlocks) || activeBlocks.length === 0) return []
+  const COMPRESSED_BLOCK_HEADER = "[Compressed conversation section]"
+  const out = []
+  for (const b of activeBlocks) {
+    if (!b || typeof b.blockId !== "string") continue
+    const idNum = Number.parseInt(b.blockId.slice(1), 10)
+    if (!Number.isInteger(idNum)) continue
+    const body = (enhancedSummaries instanceof Map
+      ? (enhancedSummaries.get(b.blockId) || b.rawSummary || "")
+      : (b.rawSummary || "")).trim()
+    const wrapped = body.length === 0
+      ? `${COMPRESSED_BLOCK_HEADER}\n<dcp-message-id>b${idNum}</dcp-message-id>`
+      : `${COMPRESSED_BLOCK_HEADER}\n${body}\n\n<dcp-message-id>b${idNum}</dcp-message-id>`
+    const tokens = estimateMessageTokens({
+      role: "user",
+      content: [{ type: "text", text: wrapped }],
+    })
+    out.push({
+      blockId: idNum,
+      topic: typeof b.topic === "string" ? b.topic : "",
+      approxTokens: tokens,
+    })
+  }
+  return out
+}
+
+/**
+ * Compute the synthetic-message token total for the active compress blocks.
+ *
+ * Each active block inserts exactly ONE synthetic user message at its
+ * `anchorIndex` containing `wrapCompressedSummary(blockId, body)`, where
+ * `body` is the final enhanced summary text (or rawSummary as fallback).
+ * We reconstruct the same string here so the synthetic token total can
+ * be subtracted from the covered-original total.
+ *
+ * @param {Array<object>} activeBlocks
+ * @param {Map<string, string>} enhancedSummaries
+ * @returns {number} token total across the inserted synthetics
+ */
+function sumTokensForSynthetics(activeBlocks, enhancedSummaries) {
   if (!Array.isArray(activeBlocks) || activeBlocks.length === 0) return 0
+  const summaries =
+    enhancedSummaries instanceof Map
+      ? enhancedSummaries
+      : new Map(Object.entries(enhancedSummaries || {}))
+  const COMPRESSED_BLOCK_HEADER = "[Compressed conversation section]"
   let total = 0
   for (const b of activeBlocks) {
-    const summary = enhancedSummaries.get(b.blockId)
-    if (typeof summary === "string") total += Math.max(0, (b.rawSummary || "").length - summary.length)
+    if (!b || typeof b.blockId !== "string") continue
+    const idNum = Number.parseInt(b.blockId.slice(1), 10)
+    if (!Number.isInteger(idNum)) continue
+    const body = (summaries.get(b.blockId) || b.rawSummary || "").trim()
+    const wrapped = body.length === 0
+      ? `${COMPRESSED_BLOCK_HEADER}\n<dcp-message-id>b${idNum}</dcp-message-id>`
+      : `${COMPRESSED_BLOCK_HEADER}\n${body}\n\n<dcp-message-id>b${idNum}</dcp-message-id>`
+    // The synthetic message is a user-role message with one text block
+    // containing the wrapped summary — matches the shape produced by
+    // applyCompressions so the estimator matches the on-the-wire cost.
+    total += estimateMessageTokens({ role: "user", content: [{ type: "text", text: wrapped }] })
   }
-  // Return a count of "characters saved" / 4 → tokens. Stats display only.
-  return Math.max(0, Math.round(total / 4))
+  return total
+}
+
+/**
+ * Gate 1.5 A1 — compress savings = covered-original tokens − synthetic
+ * tokens.
+ *
+ * Pre-fix estimator summed (rawSummary.length − enhancedSummary.length)/4,
+ * which is ~0 for every well-behaved compress call (the model writes a
+ * concise summary, often shorter than the placeholder) — production users
+ * saw 0 compress savings even after large compress blocks saved real wire
+ * tokens. The corrected semantics match the on-the-wire saving the user
+ * cares about:
+ *
+ *     savings = Σ estimateMessageTokens(covered originals, dedup'd via
+ *               union of active blocks' coveredIndices)
+ *             − Σ estimateMessageTokens(inserted synthetic summaries)
+ *
+ * The `coveredOriginalTokens` arg is computed by the caller BEFORE
+ * applyCompressions (which mutates the messages array); the synthetic
+ * total is derived here from enhancedSummaries + activeBlocks directly
+ * (we reconstruct what applyCompressions would have inserted).
+ *
+ * Nested consume semantics: only ACTIVE blocks contribute. Consumed
+ * blocks (whose anchor lies inside another active block's covered range)
+ * are filtered out by the caller's filterActiveBlocks; their covered
+ * indices are subsumed by the consuming block's range and counted exactly
+ * once via the coveredIndices Set.
+ *
+ * @param {Array<object>} activeBlocks
+ * @param {Map<string, string>} enhancedSummaries
+ * @param {number} coveredOriginalTokens
+ * @returns {number} max(0, coveredOriginalTokens − syntheticTokens)
+ */
+function estimateCompressSavings(activeBlocks, enhancedSummaries, coveredOriginalTokens) {
+  if (!Array.isArray(activeBlocks) || activeBlocks.length === 0) return 0
+  if (!Number.isFinite(coveredOriginalTokens) || coveredOriginalTokens <= 0) return 0
+  const syntheticTokens = sumTokensForSynthetics(activeBlocks, enhancedSummaries)
+  return Math.max(0, coveredOriginalTokens - syntheticTokens)
 }
 
 /**
@@ -612,4 +910,184 @@ function isOverMax(cfg, usage) {
   const max = cfg.compress.maxContextLimit
   if (typeof max !== "number" || !Number.isFinite(max)) return false
   return total > max
+}
+
+// ---------------------------------------------------------------------------
+// Gate 1.5 B2 — sweep helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Find the LAST user prompt in `messages` and return its index. Returns
+ * -1 if no user prompt exists (DCP sweep.ts:38-47 semantics).
+ *
+ * ZCode-specific semantic: we want "the user's last prompt that triggered
+ * tool activity" — not just any user-role message. Anthropic /v1/messages
+ * carries tool_results in user-role messages too, so a literal "last
+ * user-role" lookup would point at the trailing tool_result, which would
+ * mean "tools after that" = [] and sweep would silently do nothing.
+ *
+ * The heuristic: a user prompt is a user-role message with at least one
+ * `text` content block. Auto-generated tool_result-only user messages
+ * (the model echoing tool outputs back) are not prompts and are skipped.
+ *
+ * Note: this is a faithful approximation of DCP's `isIgnoredUserMessage`
+ * filter for the sweep case — DCP filters out messages containing the
+ * sweep trigger text; we filter out messages that contain no text at all.
+ * In practice, the only way a tool_result-only user message would be the
+ * LAST user message in the array is when the user typed `/dcp sweep` via
+ * the IDE slash command (which is NOT added to the messages array on
+ * ZCode) — so this heuristic correctly skips "trailing protocol noise"
+ * without ever blocking a real prompt.
+ */
+function findLastUserMessageIndex(messages) {
+  if (!Array.isArray(messages)) return -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (!m || m.role !== "user" || !Array.isArray(m.content)) continue
+    const hasText = m.content.some((p) => p && p.type === "text")
+    if (hasText) return i
+  }
+  return -1
+}
+
+/**
+ * Find the tool_result block for `callId`. Returns the block or null. The
+ * is_error flag on the block drives the "skip errors in sweep" rule.
+ */
+function findToolResultForSweep(messages, callId) {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
+    if (!m || m.role !== "user" || !Array.isArray(m.content)) continue
+    for (const p of m.content) {
+      if (
+        p && p.type === "tool_result" &&
+        typeof p === "object" &&
+        p.tool_use_id === callId
+      ) {
+        return { block: p, isError: p.is_error === true }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Compute the list of tool_use ids the sweepDirective should target.
+ *
+ * Mode semantics (DCP sweep.ts:152-168 port):
+ *   - "since-user": every tool_use AFTER the last user message in document
+ *     order. If no user message exists, returns [] (matches DCP's
+ *     "Nothing swept: no user message found" branch).
+ *   - "last-n": the LAST n tool_uses in document order (most-recent first).
+ *     If n > total tool_uses, all are targeted.
+ *
+ * Each returned target carries the metadata the pipeline needs to apply the
+ * skip rules (isProtected = protectedTools hit OR protectedFilePatterns hit).
+ * The "already in prune set" check is done separately in the consumer (it
+ * needs the live prune set).
+ *
+ * @param {Array<object>} messages
+ * @param {{mode:"since-user"|"last-n", n:number|null, requestedAt:number}} directive
+ * @returns {Array<{id:string, name:string, parameters:object, isProtected:boolean}>}
+ */
+function computeSweepTargetIds(messages, directive) {
+  const targets = []
+  if (!Array.isArray(messages) || !directive) return targets
+  // Collect all tool_uses in document order (we need every one, even before
+  // the user-anchor, so last-n can take the trailing n).
+  const allToolUses = []
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
+    if (!m || m.role !== "assistant" || !Array.isArray(m.content)) continue
+    for (const p of m.content) {
+      if (
+        p && p.type === "tool_use" &&
+        typeof p.id === "string" && p.id.length > 0
+      ) {
+        allToolUses.push({
+          id: p.id,
+          name: typeof p.name === "string" ? p.name : "",
+          parameters: p.input && typeof p.input === "object" ? p.input : {},
+          index: i,
+        })
+      }
+    }
+  }
+  let scoped
+  if (directive.mode === "since-user") {
+    const lastUser = findLastUserMessageIndex(messages)
+    if (lastUser < 0) return []
+    scoped = allToolUses.filter((t) => t.index > lastUser)
+  } else if (directive.mode === "last-n") {
+    const n = Number.isFinite(directive.n) && directive.n > 0 ? Math.floor(directive.n) : 0
+    if (n === 0) return []
+    // Take the LAST n (most recent) in document order.
+    scoped = allToolUses.slice(Math.max(0, allToolUses.length - n))
+  } else {
+    return []
+  }
+
+  // isProtected is derived by applySweepSkipRules below (cfg-driven); the
+  // consumer (call site) checks prunePlan.pruneToolCallIds.has(id) for
+  // "already applied" against the live prune set.
+  return scoped
+}
+
+/**
+ * Decide which of `targets` is "protected" (skip in sweep). Two reasons:
+ *   - tool name hits commands.protectedTools
+ *   - tool parameters hit protectedFilePatterns via getFilePathsFromParameters
+ * Returns a new array where each target carries `isProtected: boolean`.
+ */
+function applySweepSkipRules(targets, cfg) {
+  const protectedTools = (cfg && cfg.commands && Array.isArray(cfg.commands.protectedTools))
+    ? cfg.commands.protectedTools
+    : []
+  const protectedFilePatterns = (cfg && Array.isArray(cfg.protectedFilePatterns))
+    ? cfg.protectedFilePatterns
+    : []
+  return targets.map((t) => {
+    const byName = isToolNameProtected(t.name, protectedTools)
+    const paths = getFilePathsFromParameters(t.name, t.parameters)
+    const byPath = isFilePathProtected(paths, protectedFilePatterns)
+    return {
+      ...t,
+      isProtected: byName || byPath,
+      byName,
+      byPath,
+      isError: false, // patched by caller after we see the tool_result
+    }
+  })
+}
+
+/**
+ * Estimate the per-block token count for a sweep target id — the union of
+ * its tool_use block and the matching tool_result block. Mirrors the
+ * estimate used by planPrune (dedup/purge buckets).
+ */
+function estimateSweepBlockTokens(messages, id) {
+  let total = 0
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
+    if (!m || !Array.isArray(m.content)) continue
+    for (const p of m.content) {
+      if (!p || typeof p !== "object") continue
+      if (p.type === "tool_use" && p.id === id) {
+        total += estimateMessageTokens({ content: [p] })
+      } else if (p.type === "tool_result" && p.tool_use_id === id) {
+        total += estimateMessageTokens({ content: [p] })
+      }
+    }
+  }
+  return total
+}
+
+/**
+ * Find a tool_use's tool_result and report whether it's an error. Used by
+ * the sweep consume block to detect "is_error" tool_results (skipped by
+ * sweep — purgeErrors handles error input cleaning separately).
+ */
+function isToolResultError(messages, id) {
+  const r = findToolResultForSweep(messages, id)
+  return r ? r.isError : false
 }
